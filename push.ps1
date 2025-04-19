@@ -11,10 +11,10 @@
 param (
     [string]$UbuntuUser = "cedra",
     [string]$UbuntuHost = "172.27.72.227",
-    [string]$RemoteRepoPath = "/home/cedra/psl_project",
+    [string]$RemoteRepoPath = "~/psl_project/",
     [string]$LocalRepoPath = (Get-Location).Path,
     [string]$BundleName = "windows-update-$(Get-Date -Format 'yyyyMMdd-HHmmss').bundle",
-    [int]$SSHTimeout = 30
+    [int]$SSHTimeout = 10
 )
 
 # Error handling setup
@@ -41,7 +41,7 @@ try {
     # 2. Create bundle of changes not on Ubuntu
     Write-Host "`nCreating Git bundle..." -ForegroundColor Cyan
     $bundlePath = Join-Path $LocalRepoPath $BundleName
-    git bundle create $bundlePath origin/main..main
+    git bundle create $bundlePath HEAD main
     
     if (-not (Test-Path $bundlePath)) {
         throw "Failed to create bundle file"
@@ -49,61 +49,37 @@ try {
     $bundleSize = (Get-Item $bundlePath).Length / 1MB
     Write-Host "Created bundle: $BundleName (${bundleSize:N2} MB)" -ForegroundColor Green
 
-    # 3. Copy bundle to Ubuntu
+    # 3. Transfer bundle
     Write-Host "`nTransferring bundle to Ubuntu..." -ForegroundColor Cyan
     $remoteBundlePath = "/tmp/$BundleName"
     
-    scp -o ConnectTimeout=$SSHTimeout $bundlePath "${UbuntuUser}@${UbuntuHost}:$remoteBundlePath"
-    Write-Host "Transfer completed" -ForegroundColor Green
-
-    # 4. Apply changes on Ubuntu
-    Write-Host "`nApplying changes on Ubuntu..." -ForegroundColor Cyan
-    $sshCommand = @"
-if [ ! -d "$RemoteRepoPath" ]; then
-    echo "Error: Remote repository path not found" >&2
-    exit 1
-fi
-cd "$RemoteRepoPath" && 
-git pull "$remoteBundlePath" && 
-echo "Changes applied successfully" || 
-exit 1
-"@
+    scp $bundlePath "${UbuntuUser}@${UbuntuHost}:$remoteBundlePath"
     
-    $output = ssh -o ConnectTimeout=$SSHTimeout ${UbuntuUser}@${UbuntuHost} $sshCommand 2>&1
-    Write-Host $output -ForegroundColor Green
+    # 4. Apply changes on Ubuntu - SINGLE LINE COMMAND
+    Write-Host "`n[4/5] Applying changes on Ubuntu..." -ForegroundColor Cyan
+    
+    # Using single line command to avoid parsing issues
+    $sshCommand = "cd $RemoteRepoPath && git pull $remoteBundlePath 2>&1"
+    Write-Host "Executing: $sshCommand" -ForegroundColor DarkGray
+    $output = ssh ${UbuntuUser}@${UbuntuHost} $sshCommand
+    
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git pull failed:`n$output"
+    }
+    Write-Host "Git pull succeeded:`n$output" -ForegroundColor Green
 
-    $success = $true
+    # 5. Cleanup
+    Write-Host "`n[5/5] Cleaning up..." -ForegroundColor Cyan
+    Remove-Item $bundlePath -ErrorAction SilentlyContinue
+    ssh ${UbuntuUser}@${UbuntuHost} "rm $remoteBundlePath" | Out-Null
+
+    Write-Host "`nUpdate completed successfully!`n" -ForegroundColor Green
 }
 catch {
     Write-Host "`nERROR: $_" -ForegroundColor Red
     Write-Host "Stack Trace: $($_.ScriptStackTrace)" -ForegroundColor DarkRed
+    exit 1
 }
 finally {
-    # 5. Cleanup
-    Write-Host "`nCleaning up..." -ForegroundColor Cyan
-    if (Test-Path $bundlePath) {
-        Remove-Item $bundlePath -ErrorAction SilentlyContinue
-        Write-Host "Local bundle removed" -ForegroundColor DarkGray
-    }
-    
-    if ($success) {
-        # Only remove remote bundle if everything succeeded
-        try {
-            ssh -o ConnectTimeout=10 ${UbuntuUser}@${UbuntuHost} "rm $remoteBundlePath" | Out-Null
-            Write-Host "Remote bundle removed" -ForegroundColor DarkGray
-        }
-        catch {
-            Write-Host "Warning: Could not remove remote bundle" -ForegroundColor Yellow
-        }
-    }
-    
     Pop-Location | Out-Null
-    
-    if ($success) {
-        Write-Host "`nUpdate completed successfully!`n" -ForegroundColor Green
-    }
-    else {
-        Write-Host "`nUpdate failed`n" -ForegroundColor Red
-        exit 1
-    }
 }
