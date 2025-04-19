@@ -1,0 +1,37 @@
+# Ignore directories
+5_dataset/
+rasa/
+model_test/fig/
+model_test/fig_4/
+psl_venv/
+
+# Ignore specific file types
+*.pth
+*.log
+
+# Standard ignores (recommended)
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+*.egg-info/
+*.swp
+.DS_Store
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
