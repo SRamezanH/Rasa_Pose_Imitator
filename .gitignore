@@ -8,6 +8,7 @@ psl_venv/
 # Ignore specific file types
 *.pth
 *.log
+*.bundle
 
 # Standard ignores (recommended)
 *.pyc
