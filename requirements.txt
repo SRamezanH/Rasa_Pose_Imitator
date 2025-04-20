@@ -5,3 +5,4 @@ opencv-python>=4.11.0.86
 pytorch-kinematics>=0.7.5
 protobuf>=6.30.1
 tqdm
+av

@@ -616,26 +616,85 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     six_d = torch.cat([u, v_ortho], dim=-1)
     return six_d
 
-def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R = 1.0, lambda_kl = 1.0, lambda_vel = 10.0, eps: float = 1e-7):
+def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=1.0, lambda_vel=10.0, 
+          lambda_motion=2.0, lambda_rel_vel=1.5, lambda_traj=2.0, eps=1e-7):
+    """
+    Computes the loss between the predicted and actual pose data
+    
+    Args:
+        fk: Forward kinematics model
+        pose_data: Ground truth pose data [batch, 15, 3, 3]
+        model_output: Model predictions [batch, 15, 6]
+        logvar: Log variance from the model
+        mu: Mean from the model
+        lambda_R: Weight for rotation loss
+        lambda_kl: Weight for KL divergence loss
+        lambda_vel: Weight for velocity loss
+        lambda_motion: Weight for motion encouragement loss
+        lambda_rel_vel: Weight for relative velocity loss
+        lambda_traj: Weight for trajectory loss
+        eps: Small epsilon value to prevent division by zero
+        
+    Returns:
+        Tuple of total loss and individual loss components
+    """
     kine_output = fk.batch_forward_kinematics(model_output)  # [batch, 15, 48]
+    
+    # Position loss - penalizes differences in hand position
     pose_loss = mse_loss(pose_data[:,:,0], kine_output[:,:,0])
 
+    # KL divergence loss for the VAE component
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
-    velocity_in = torch.diff(pose_data[:,:,0], dim=1)
-    velocity_out = torch.diff(kine_output[:,:,0], dim=1)
+    # Velocity loss - matches the velocity profiles
+    velocity_in = torch.diff(pose_data[:,:,0], dim=1)  # [batch, 14, 3]
+    velocity_out = torch.diff(kine_output[:,:,0], dim=1)  # [batch, 14, 3]
     vel_loss = 30.0 * 15.0 * mse_loss(velocity_in, velocity_out)
 
-    input_6d = batch_vectors_to_6D(pose_data, eps = eps)
-    output_6d = batch_vectors_to_6D(kine_output, eps = eps)
+    # Rotation loss - penalizes differences in hand orientation
+    input_6d = batch_vectors_to_6D(pose_data, eps=eps)
+    output_6d = batch_vectors_to_6D(kine_output, eps=eps)
     R_loss = torch.mean((output_6d - input_6d)**2)
-    # l1_loss = nn.L1Loss()
-    # R_loss = l1_loss(input_6d, output_6d)
-
     
-    loss = pose_loss + lambda_R * R_loss + lambda_kl * kl_loss + lambda_vel * vel_loss
+    # NEW LOSS TERMS
+    
+    # Motion encouragement loss - penalizes minimal movement (encourages the hand to move)
+    # Calculate the total distance moved across frames
+    total_movement_out = torch.sum(torch.norm(velocity_out, dim=2), dim=1)  # [batch]
+    total_movement_in = torch.sum(torch.norm(velocity_in, dim=2), dim=1)  # [batch]
+    # Penalize when output movement is less than input movement
+    motion_loss = torch.mean(torch.relu(total_movement_in - total_movement_out))
 
-    return loss, pose_loss, R_loss, kl_loss, vel_loss
+    # Relative velocity loss - ensures the relative velocities between joints are similar
+    # Calculate relative velocities between hand points (wrist to finger1, wrist to finger2)
+    rel_vel_in_1 = torch.diff(pose_data[:,:,1] - pose_data[:,:,0], dim=1)  # [batch, 14, 3]
+    rel_vel_in_2 = torch.diff(pose_data[:,:,2] - pose_data[:,:,0], dim=1)  # [batch, 14, 3]
+    rel_vel_out_1 = torch.diff(kine_output[:,:,1] - kine_output[:,:,0], dim=1)  # [batch, 14, 3]
+    rel_vel_out_2 = torch.diff(kine_output[:,:,2] - kine_output[:,:,0], dim=1)  # [batch, 14, 3]
+    
+    # Compute loss on relative velocities
+    rel_vel_loss = mse_loss(rel_vel_in_1, rel_vel_out_1) + mse_loss(rel_vel_in_2, rel_vel_out_2)
+
+    # Trajectory loss - ensures the shape of the movement path is similar
+    # Compute normalized trajectory directions
+    traj_dir_in = F.normalize(velocity_in, p=2, dim=2, eps=eps)  # [batch, 14, 3]
+    traj_dir_out = F.normalize(velocity_out, p=2, dim=2, eps=eps)  # [batch, 14, 3]
+    
+    # Compute cosine similarity between directions (1 is perfect alignment)
+    # Convert to loss by taking 1 - similarity
+    cos_sim = torch.sum(traj_dir_in * traj_dir_out, dim=2)  # [batch, 14]
+    traj_loss = torch.mean(1.0 - cos_sim)
+    
+    # Combine all loss terms with their respective weights
+    loss = (pose_loss + 
+            lambda_R * R_loss + 
+            lambda_kl * kl_loss + 
+            lambda_vel * vel_loss +
+            lambda_motion * motion_loss +
+            lambda_rel_vel * rel_vel_loss +
+            lambda_traj * traj_loss)
+
+    return loss, pose_loss, R_loss, kl_loss, vel_loss, motion_loss, rel_vel_loss, traj_loss
 
 def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.1):
     """
@@ -747,6 +806,9 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         total_R_loss = 0
         total_kl_loss = 0
         total_vel_loss = 0
+        total_motion_loss = 0
+        total_rel_vel_loss = 0
+        total_traj_loss = 0
         
         # Create progress bar for batches
         batch_pbar = tqdm(
@@ -764,7 +826,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             model_output, mu, logvar = model(video_data)  # Output: [batch, 15, 26] (predicted)
 
             # Compute loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R = lambda_R, lambda_kl = lambda_kl)
+            loss, pose_loss, R_loss, kl_loss, vel_loss, motion_loss, rel_vel_loss, traj_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R = lambda_R, lambda_kl = lambda_kl)
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
@@ -777,12 +839,18 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             R_loss_val = R_loss.item()
             kl_loss_val = kl_loss.item()
             vel_loss_val = vel_loss.item()
+            motion_loss_val = motion_loss.item()
+            rel_vel_loss_val = rel_vel_loss.item()
+            traj_loss_val = traj_loss.item()
 
             total_loss += loss_val
             total_pose_loss += pose_loss_val
             total_R_loss += R_loss_val
             total_kl_loss += kl_loss_val
             total_vel_loss += vel_loss_val
+            total_motion_loss += motion_loss_val
+            total_rel_vel_loss += rel_vel_loss_val
+            total_traj_loss += traj_loss_val
 
             # Update progress bar with current loss
             batch_pbar.set_postfix({
@@ -790,7 +858,10 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 'pose_loss': f'{pose_loss_val:.2f}', 
                 'R_loss': f'{R_loss_val:.2f}', 
                 'kl_loss': f'{kl_loss_val:.2f}', 
-                'vel_loss': f'{vel_loss_val:.2f}'
+                'vel_loss': f'{vel_loss_val:.2f}',
+                'motion_loss': f'{motion_loss_val:.2f}',
+                'rel_vel_loss': f'{rel_vel_loss_val:.2f}',
+                'traj_loss': f'{traj_loss_val:.2f}'
             })
 
         scheduler.step()
@@ -800,6 +871,9 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         total_R_loss /= len(train_loader)
         total_kl_loss /= len(train_loader)
         total_vel_loss /= len(train_loader)
+        total_motion_loss /= len(train_loader)
+        total_rel_vel_loss /= len(train_loader)
+        total_traj_loss /= len(train_loader)
 
         # Evaluation
         model.eval()  # Set model to evaluation mode
@@ -808,6 +882,9 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         eval_R_loss = 0
         eval_kl_loss = 0
         eval_vel_loss = 0
+        eval_motion_loss = 0
+        eval_rel_vel_loss = 0
+        eval_traj_loss = 0
     
         # Progress bar for test batches
         eval_pbar = tqdm(
@@ -827,19 +904,25 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 model_output, mu, logvar = model(video_data)
 
                 # Compute loss
-                loss, pose_loss, R_loss, kl_loss, vel_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R = lambda_R, lambda_kl = lambda_kl)
+                loss, pose_loss, R_loss, kl_loss, vel_loss, motion_loss, rel_vel_loss, traj_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R = lambda_R, lambda_kl = lambda_kl)
                 
                 loss_val = loss
                 pose_loss_val = pose_loss
                 R_loss_val = R_loss
                 kl_loss_val = kl_loss
                 vel_loss_val = vel_loss
+                motion_loss_val = motion_loss
+                rel_vel_loss_val = rel_vel_loss
+                traj_loss_val = traj_loss
 
                 eval_loss += loss_val
                 eval_pose_loss += pose_loss_val
                 eval_R_loss += R_loss_val
                 eval_kl_loss += kl_loss_val
                 eval_vel_loss += vel_loss_val
+                eval_motion_loss += motion_loss_val
+                eval_rel_vel_loss += rel_vel_loss_val
+                eval_traj_loss += traj_loss_val
 
                 # Update progress bar
                 eval_pbar.set_postfix({
@@ -847,13 +930,19 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                     'pose_loss': f'{pose_loss_val:.2f}', 
                     'R_loss': f'{R_loss_val:.2f}', 
                     'kl_loss': f'{kl_loss_val:.2f}', 
-                    'vel_loss': f'{vel_loss_val:.2f}'
+                    'vel_loss': f'{vel_loss_val:.2f}',
+                    'motion_loss': f'{motion_loss_val:.2f}',
+                    'rel_vel_loss': f'{rel_vel_loss_val:.2f}',
+                    'traj_loss': f'{traj_loss_val:.2f}'
                 })
         eval_loss /= len(eval_loader)
         eval_pose_loss /= len(eval_loader)
         eval_R_loss /= len(eval_loader)
         eval_kl_loss /= len(eval_loader)
         eval_vel_loss /= len(eval_loader)
+        eval_motion_loss /= len(eval_loader)
+        eval_rel_vel_loss /= len(eval_loader)
+        eval_traj_loss /= len(eval_loader)
 
         # Check Overfitting
         if(eval_loss <= best_eval_loss):
@@ -880,7 +969,13 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         # lambda_kl *= 0.9
 
         # Print epoch summary
-        print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s\nTrain Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, R Loss: {total_R_loss:.5f}, KL Loss: {total_kl_loss:.5f}, Vel Loss: {total_vel_loss:.5f}\nEval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, R Loss: {eval_R_loss:.5f}, KL Loss: {eval_kl_loss:.5f}, Vel Loss: {eval_vel_loss:.5f}")
+        print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s\n" 
+              f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, R Loss: {total_R_loss:.5f}, "
+              f"KL Loss: {total_kl_loss:.5f}, Vel Loss: {total_vel_loss:.5f}, "
+              f"Motion Loss: {total_motion_loss:.5f}, Rel Vel Loss: {total_rel_vel_loss:.5f}, Traj Loss: {total_traj_loss:.5f}\n"
+              f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, R Loss: {eval_R_loss:.5f}, "
+              f"KL Loss: {eval_kl_loss:.5f}, Vel Loss: {eval_vel_loss:.5f}, "
+              f"Motion Loss: {eval_motion_loss:.5f}, Rel Vel Loss: {eval_rel_vel_loss:.5f}, Traj Loss: {eval_traj_loss:.5f}")
         
     print(f"\nTraining completed in {num_epochs} epochs")
 

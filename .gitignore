@@ -10,6 +10,7 @@ psl_venv/
 *.log
 *.bundle
 *.zip
+*.ps1
 
 # Standard ignores (recommended)
 *.pyc
