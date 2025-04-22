@@ -345,16 +345,17 @@ class PoseVideoCNNRNN(nn.Module):
             nn.Linear(64, 32),
             nn.LeakyReLU(0.1),
         )
-        nn.init.kaiming_normal_(self.fc_mu[1].weight, mode='fan_in', nonlinearity='relu')
-        nn.init.zeros_(self.fc_mu[1].bias)
+        nn.init.kaiming_normal_(self.fc_mu[2].weight, mode='fan_in', nonlinearity='relu')
+        nn.init.zeros_(self.fc_mu[2].bias)
 
         self.fc_logvar = nn.Sequential(
+            nn.LeakyReLU(0.1),
             nn.Dropout(0.1),
             nn.Linear(64, 32),
             nn.LeakyReLU(0.1),
         )
-        nn.init.kaiming_normal_(self.fc_logvar[1].weight, mode='fan_in', nonlinearity='relu')
-        nn.init.zeros_(self.fc_logvar[1].bias)
+        nn.init.kaiming_normal_(self.fc_logvar[2].weight, mode='fan_in', nonlinearity='relu')
+        nn.init.zeros_(self.fc_logvar[2].bias)
         
         # Second LSTM/GRU layer for time series modeling
         self.temporal_rnn2 = nn.LSTM(
