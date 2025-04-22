@@ -313,8 +313,8 @@ class PoseVideoCNNRNN(nn.Module):
         # LSTM/GRU for temporal modeling
         self.temporal_rnn1 = nn.LSTM(
                 input_size=256*4*4,
-                hidden_size=64,
-                num_layers=2,
+                hidden_size=128,
+                num_layers=1,
                 batch_first=True,
                 bidirectional=False,
             )
@@ -327,7 +327,7 @@ class PoseVideoCNNRNN(nn.Module):
                 nn.init.zeros_(param.data)  # Biases typically zero-initialized
                 # Optional: Initialize forget gate bias to 1 (helps with training)
                 if 'bias_hh' in name:
-                    param.data[64:128] = 1.0
+                    param.data[128:256] = 1.0
 
         # self.L1 = nn.Sequential(
         #     nn.LeakyReLU(0.1),
@@ -342,7 +342,7 @@ class PoseVideoCNNRNN(nn.Module):
         self.fc_mu = nn.Sequential(
             nn.LeakyReLU(0.1),
             nn.Dropout(0.1),
-            nn.Linear(64, 32),
+            nn.Linear(128, 64),
             nn.LeakyReLU(0.1),
         )
         nn.init.kaiming_normal_(self.fc_mu[2].weight, mode='fan_in', nonlinearity='relu')
@@ -351,7 +351,7 @@ class PoseVideoCNNRNN(nn.Module):
         self.fc_logvar = nn.Sequential(
             nn.LeakyReLU(0.1),
             nn.Dropout(0.1),
-            nn.Linear(64, 32),
+            nn.Linear(128, 64),
             nn.LeakyReLU(0.1),
         )
         nn.init.kaiming_normal_(self.fc_logvar[2].weight, mode='fan_in', nonlinearity='relu')
@@ -360,7 +360,7 @@ class PoseVideoCNNRNN(nn.Module):
         # Second LSTM/GRU layer for time series modeling
         self.temporal_rnn2 = nn.LSTM(
                 input_size=32,
-                hidden_size=16,
+                hidden_size=32,
                 num_layers=2,
                 batch_first=True,
                 bidirectional=False,
@@ -378,7 +378,7 @@ class PoseVideoCNNRNN(nn.Module):
 
         self.output_layer = nn.Sequential(
             nn.LeakyReLU(0.1),
-            nn.Linear(16, 6),
+            nn.Linear(32, 6),
             nn.Sigmoid(),
         )
         nn.init.xavier_normal_(self.output_layer[1].weight)  # Xavier/Glorot initialization
@@ -412,11 +412,11 @@ class PoseVideoCNNRNN(nn.Module):
             embedding += torch.rand_like(std) * std
 
         # Repeat vector to 15x32
-        # repeated = embedding.unsqueeze(1).repeat(1, 15, 1)  # Shape: [batch_size, 15, 32]
+        embedding = embedding.view(2, batch_size, 32)
         decoder_input = torch.zeros(batch_size, seq_len, 32).to(device)
 
         # Second RNN for time series modeling
-        rnn_out2, _ = self.temporal_rnn2(decoder_input, embedding)  # Shape: [batch_size, 15, 64]
+        rnn_out2, _ = self.temporal_rnn2(decoder_input, (embedding, embedding))  # Shape: [batch_size, 15, 64]
 
         # Output layer to get final 15x26 sequence
         output = self.output_layer(rnn_out2)  # Shape: [batch_size, 15, 26]
