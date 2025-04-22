@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import random
-from torch.optim.lr_scheduler import ExponentialLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision.io import read_video
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
@@ -283,15 +283,11 @@ class PoseVideoDataset(Dataset):
 
 
 # Neural Network Model Definition
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
-        # CNN to extract spatial features from video frames
+        # CNN for spatial feature extraction
         self.video_cnn = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm2d(32),
@@ -304,21 +300,49 @@ class PoseVideoCNNRNN(nn.Module):
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.1),
-            nn.AdaptiveAvgPool2d(1),  # Global Average Pooling to reduce dimensions
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1),
+            nn.AdaptiveAvgPool2d((4, 4)),  # Global Average Pooling
         )
-        
-        # Initialize the CNN weights using He initialization
-        for i in [0, 4, 8]:
+        for i in [0, 4, 8, 12]:
             nn.init.kaiming_normal_(self.video_cnn[i].weight, mode='fan_in', nonlinearity='relu')
             nn.init.zeros_(self.video_cnn[i].bias)
 
-        # Temporal modeling with LSTM and a linear layer
-        self.temporal_encoder = nn.LSTM(input_size=128, hidden_size=64, num_layers=2, batch_first=True)
+        # LSTM/GRU for temporal modeling
+        self.temporal_rnn1 = nn.LSTM(
+                input_size=256*4*4,
+                hidden_size=64,
+                num_layers=2,
+                batch_first=True,
+                bidirectional=False,
+            )
+        for name, param in self.temporal_rnn1.named_parameters():
+            if 'weight_ih' in name:  # Input-hidden weights
+                nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:  # Hidden-hidden weights (recurrent)
+                nn.init.orthogonal_(param.data)  # Helps with long-term dependencies
+            elif 'bias' in name:
+                nn.init.zeros_(param.data)  # Biases typically zero-initialized
+                # Optional: Initialize forget gate bias to 1 (helps with training)
+                if 'bias_hh' in name:
+                    param.data[64:128] = 1.0
 
-        # Latent space projection layers (mean and log variance)
+        # self.L1 = nn.Sequential(
+        #     nn.LeakyReLU(0.1),
+        #     nn.Dropout(0.1),
+        #     nn.Linear(32, 16),
+        #     nn.LeakyReLU(0.1)
+        # )
+        # nn.init.kaiming_normal_(self.L1[2].weight, mode='fan_in', nonlinearity='relu')
+        # nn.init.zeros_(self.L1[2].bias)
+
+        # Latent space projection
         self.fc_mu = nn.Sequential(
+            nn.LeakyReLU(0.1),
             nn.Dropout(0.1),
-            nn.Linear(64, 32),  # Adjusted for hidden_size=64
+            nn.Linear(64, 32),
             nn.LeakyReLU(0.1),
         )
         nn.init.kaiming_normal_(self.fc_mu[1].weight, mode='fan_in', nonlinearity='relu')
@@ -326,64 +350,79 @@ class PoseVideoCNNRNN(nn.Module):
 
         self.fc_logvar = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(64, 32),  # Adjusted for hidden_size=64
+            nn.Linear(64, 32),
             nn.LeakyReLU(0.1),
         )
         nn.init.kaiming_normal_(self.fc_logvar[1].weight, mode='fan_in', nonlinearity='relu')
         nn.init.zeros_(self.fc_logvar[1].bias)
-
+        
+        # Second LSTM/GRU layer for time series modeling
         self.temporal_rnn2 = nn.LSTM(
                 input_size=32,
-                hidden_size=64,
-                num_layers=1,
+                hidden_size=16,
+                num_layers=2,
                 batch_first=True,
                 bidirectional=False,
             )
+        for name, param in self.temporal_rnn1.named_parameters():
+            if 'weight_ih' in name:  # Input-hidden weights
+                nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:  # Hidden-hidden weights (recurrent)
+                nn.init.orthogonal_(param.data)  # Helps with long-term dependencies
+            elif 'bias' in name:
+                nn.init.zeros_(param.data)  # Biases typically zero-initialized
+                # Optional: Initialize forget gate bias to 1 (helps with training)
+                if 'bias_hh' in name:
+                    param.data[16:32] = 1.0
 
-        # Final output layer for predicting joint values
         self.output_layer = nn.Sequential(
             nn.LeakyReLU(0.1),
-            nn.Linear(64, 16),
-            nn.LeakyReLU(0.1),
             nn.Linear(16, 6),
-            nn.Sigmoid(),  # Using sigmoid for normalizing joint values
+            nn.Sigmoid(),
         )
-        nn.init.xavier_normal_(self.output_layer[1].weight)
-        nn.init.zeros_(self.output_layer[1].bias)
+        nn.init.xavier_normal_(self.output_layer[1].weight)  # Xavier/Glorot initialization
+        nn.init.zeros_(self.output_layer[1].bias)  # Initialize bias to zeros
 
     def forward(self, video, deterministic=False):
         batch_size, seq_len, c, h, w = video.size()
 
-        # Extract features from the video using CNN
-        video = video.view(batch_size * seq_len, c, h, w)
-        video = self.video_cnn(video)  # Output: [batch_size * seq_len, 128, 1, 1]
-        video = video.view(batch_size, seq_len, 128)  # Reshape to [batch_size, seq_len, 128]
+        # CNN feature extraction
+        # print(video.mean(), video.std())
+        video = video.view(batch_size*seq_len, c, h, w)
+        video = self.video_cnn(video)
+        # print(video.mean(), video.std())
+        video = video.squeeze()
+        video = video.view(batch_size, seq_len, 128)
 
-        # Temporal modeling with LSTM
-        temporal_features, (h_n, c_n) = self.temporal_encoder(video)  # Output: [batch_size, seq_len, 64]
+        # First RNN (LSTM/GRU) for temporal modeling
+        #_, (rnn_out, _) = self.temporal_rnn1(video)
+        _, (rnn_out, _) = self.temporal_rnn1(video)
+        rnn_out = rnn_out.squeeze(0)
+        # rnn_out = self.L1(rnn_out)
 
-        # Latent space projection (mean and log variance)
-        mu = self.fc_mu(temporal_features[:, -1, :])  # Use the last timestep's features
-        logvar = torch.clamp(self.fc_logvar(temporal_features[:, -1, :]), min=-10, max=10)
+        # Latent space
+        mu = self.fc_mu(rnn_out)
+        logvar = torch.clamp(self.fc_logvar(rnn_out), min=-10, max=10)
 
-        # Reparameterization trick for variance inference
+        # reparameterization
         embedding = mu
         if not deterministic:
             std = torch.exp(0.5 * logvar)
-            embedding += torch.randn_like(std) * std
+            embedding += torch.rand_like(std) * std
 
-        # Repeat the embedding for each frame in the sequence (15 frames)
-        repeated = embedding.unsqueeze(1).repeat(1, 15, 1)  # Output: [batch_size, 15, 32]
+        # Repeat vector to 15x32
+        # repeated = embedding.unsqueeze(1).repeat(1, 15, 1)  # Shape: [batch_size, 15, 32]
+        decoder_input = torch.zeros(batch_size, seq_len, 32).to(device)
 
-        rnn_out2, _ = self.temporal_rnn2(repeated)  # Shape: [batch_size, 15, 64]
+        # Second RNN for time series modeling
+        rnn_out2, _ = self.temporal_rnn2(decoder_input, embedding)  # Shape: [batch_size, 15, 64]
 
         # Output layer to get final 15x26 sequence
-        output = self.output_layer(rnn_out2)  # Output: [batch_size, 15, 26]
-
-        # Debug print for output shapes
-        print(f"output shape: {output.shape}, mu shape: {mu.shape}, logvar shape: {logvar.shape}")
+        output = self.output_layer(rnn_out2)  # Shape: [batch_size, 15, 26]
+        # output = torch.clamp(output, 0, 1)  # Apply clamp to ensure outputs are between 0 and 1
 
         return output, mu, logvar
+
 
 class ForwardKinematics:
     def __init__(self, urdf_path):
@@ -583,72 +622,87 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     six_d = torch.cat([u, v_ortho], dim=-1)
     return six_d
 
-def loss_fn(fk, pose_data, model_output, logvar, mu, 
-            lambda_R=1.0, lambda_kl=0.1, lambda_vel=5.0, 
-            lambda_motion=5.0, lambda_rel_vel=1.0, lambda_traj=2.0, eps=1e-7):
+def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, 
+          lambda_motion=2.0, lambda_rel_vel=1.5, lambda_traj=2.0, eps=1e-7):
     """
     Computes the loss between the predicted and actual pose data
+    
+    Args:
+        fk: Forward kinematics model
+        pose_data: Ground truth pose data [batch, 15, 3, 3]
+        model_output: Model predictions [batch, 15, 6]
+        logvar: Log variance from the model
+        mu: Mean from the model
+        lambda_R: Weight for rotation loss
+        lambda_kl: Weight for KL divergence loss
+        lambda_vel: Weight for velocity loss
+        lambda_motion: Weight for motion encouragement loss
+        lambda_rel_vel: Weight for relative velocity loss
+        lambda_traj: Weight for trajectory loss
+        eps: Small epsilon value to prevent division by zero
+        
+    Returns:
+        Tuple of total loss and individual loss components
     """
-
-    # First compute forward kinematics output
     kine_output = fk.batch_forward_kinematics(model_output)  # [batch, 15, 48]
-
-    # Add acceleration loss
-    accel_in = torch.diff(pose_data[:,:,0], n=2, dim=1)
-    accel_out = torch.diff(kine_output[:,:,0], n=2, dim=1)
-    accel_loss = mse_loss(accel_in, accel_out)
-
-    # Position loss
+    
+    # Position loss - penalizes differences in hand position
     pose_loss = mse_loss(pose_data[:,:,0], kine_output[:,:,0])
 
-    # KL divergence loss
+    # KL divergence loss for the VAE component
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
-    # Velocity loss
-    velocity_in = torch.diff(pose_data[:,:,0], dim=1)
-    velocity_out = torch.diff(kine_output[:,:,0], dim=1)
+    # Velocity loss - matches the velocity profiles
+    velocity_in = torch.diff(pose_data[:,:,0], dim=1)  # [batch, 14, 3]
+    velocity_out = torch.diff(kine_output[:,:,0], dim=1)  # [batch, 14, 3]
     vel_loss = 30.0 * 15.0 * mse_loss(velocity_in, velocity_out)
 
-    # Rotation loss
+    # Rotation loss - penalizes differences in hand orientation
     input_6d = batch_vectors_to_6D(pose_data, eps=eps)
     output_6d = batch_vectors_to_6D(kine_output, eps=eps)
     R_loss = torch.mean((output_6d - input_6d)**2)
+    
+    # NEW LOSS TERMS
+    
+    # Motion encouragement loss - penalizes minimal movement (encourages the hand to move)
+    # Calculate the total distance moved across frames
+    total_movement_out = torch.sum(torch.norm(velocity_out, dim=2), dim=1)  # [batch]
+    total_movement_in = torch.sum(torch.norm(velocity_in, dim=2), dim=1)  # [batch]
+    # Penalize when output movement is less than input movement
+    motion_loss = torch.mean(torch.relu(total_movement_in - total_movement_out))
 
-    # Motion encouragement loss
-    total_movement_out = torch.sum(torch.norm(velocity_out, dim=2), dim=1)
-    motion_loss = torch.exp(-total_movement_out.mean())
-
-    # Relative velocity loss
-    rel_vel_in_1 = torch.diff(pose_data[:,:,1] - pose_data[:,:,0], dim=1)
-    rel_vel_in_2 = torch.diff(pose_data[:,:,2] - pose_data[:,:,0], dim=1)
-    rel_vel_out_1 = torch.diff(kine_output[:,:,1] - kine_output[:,:,0], dim=1)
-    rel_vel_out_2 = torch.diff(kine_output[:,:,2] - kine_output[:,:,0], dim=1)
+    # Relative velocity loss - ensures the relative velocities between joints are similar
+    # Calculate relative velocities between hand points (wrist to finger1, wrist to finger2)
+    rel_vel_in_1 = torch.diff(pose_data[:,:,1] - pose_data[:,:,0], dim=1)  # [batch, 14, 3]
+    rel_vel_in_2 = torch.diff(pose_data[:,:,2] - pose_data[:,:,0], dim=1)  # [batch, 14, 3]
+    rel_vel_out_1 = torch.diff(kine_output[:,:,1] - kine_output[:,:,0], dim=1)  # [batch, 14, 3]
+    rel_vel_out_2 = torch.diff(kine_output[:,:,2] - kine_output[:,:,0], dim=1)  # [batch, 14, 3]
+    
+    # Compute loss on relative velocities
     rel_vel_loss = mse_loss(rel_vel_in_1, rel_vel_out_1) + mse_loss(rel_vel_in_2, rel_vel_out_2)
 
-    # Trajectory loss
-    traj_dir_in = F.normalize(velocity_in, p=2, dim=2, eps=eps)
-    traj_dir_out = F.normalize(velocity_out, p=2, dim=2, eps=eps)
-    cos_sim = torch.sum(traj_dir_in * traj_dir_out, dim=2)
+    # Trajectory loss - ensures the shape of the movement path is similar
+    # Compute normalized trajectory directions
+    traj_dir_in = F.normalize(velocity_in, p=2, dim=2, eps=eps)  # [batch, 14, 3]
+    traj_dir_out = F.normalize(velocity_out, p=2, dim=2, eps=eps)  # [batch, 14, 3]
+    
+    # Compute cosine similarity between directions (1 is perfect alignment)
+    # Convert to loss by taking 1 - similarity
+    cos_sim = torch.sum(traj_dir_in * traj_dir_out, dim=2)  # [batch, 14]
     traj_loss = torch.mean(1.0 - cos_sim)
-
-    # Motion initiation penalty
-    first_move = torch.norm(velocity_out[:,0], dim=1).mean()
-    init_loss = torch.relu(0.1 - first_move)
-
-    # Final combined loss
+    
+    # Combine all loss terms with their respective weights
     loss = (pose_loss + 
             lambda_R * R_loss + 
             lambda_kl * kl_loss + 
             lambda_vel * vel_loss +
-            2.0 * accel_loss +
-            10.0 * init_loss +
             lambda_motion * motion_loss +
             lambda_rel_vel * rel_vel_loss +
             lambda_traj * traj_loss)
 
-    return loss, pose_loss, R_loss, kl_loss, vel_loss, motion_loss, rel_vel_loss, traj_loss,accel_loss, init_loss
+    return loss, pose_loss, R_loss, kl_loss, vel_loss, motion_loss, rel_vel_loss, traj_loss
 
-def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.1):
+def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.01):
     """
     Train the neural network model
 
@@ -725,12 +779,11 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 print(f"Non-trainable Parameters: {model_stats.total_params - model_stats.trainable_params:,}\n")
 
     # Create model, loss function, and optimizer
-    lambda_R = 1.0
     lambda_kl = 0.1
 
     model = PoseVideoCNNRNN().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)#geoopt.optim.RiemannianAdam(model.parameters(), lr=learning_rate)
-    scheduler = ExponentialLR(optimizer, gamma=0.95)
+    scheduler = ReduceLROnPlateau(optimizer, 'min')
 
 
     # Initialize forward kinematics
@@ -761,8 +814,6 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         total_motion_loss = 0
         total_rel_vel_loss = 0
         total_traj_loss = 0
-        total_accel_loss=0
-        total_init_loss=0
         
         # Create progress bar for batches
         batch_pbar = tqdm(
@@ -780,11 +831,11 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             model_output, mu, logvar = model(video_data)  # Output: [batch, 15, 26] (predicted)
 
             # Compute loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, motion_loss, rel_vel_loss, traj_loss, accel_loss, init_loss= loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R = lambda_R, lambda_kl = lambda_kl)
+            loss, pose_loss, R_loss, kl_loss, vel_loss, motion_loss, rel_vel_loss, traj_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl)
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(),max_norm= 1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             # Update running loss
@@ -796,10 +847,6 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             motion_loss_val = motion_loss.item()
             rel_vel_loss_val = rel_vel_loss.item()
             traj_loss_val = traj_loss.item()
-            accel_loss_val=accel_loss.item()
-            init_loss_val=init_loss.item()
-
-
 
             total_loss += loss_val
             total_pose_loss += pose_loss_val
@@ -809,8 +856,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             total_motion_loss += motion_loss_val
             total_rel_vel_loss += rel_vel_loss_val
             total_traj_loss += traj_loss_val
-            total_accel_loss+= accel_loss_val
-            total_init_loss+= init_loss_val
+
             # Update progress bar with current loss
             batch_pbar.set_postfix({
                 'loss': f'{loss_val:.2f}', 
@@ -820,12 +866,8 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 'vel_loss': f'{vel_loss_val:.2f}',
                 'motion_loss': f'{motion_loss_val:.2f}',
                 'rel_vel_loss': f'{rel_vel_loss_val:.2f}',
-                'traj_loss': f'{traj_loss_val:.2f}',
-                'accel': f'{accel_loss.item():.2f}',
-                'init': f'{init_loss.item():.2f}'
+                'traj_loss': f'{traj_loss_val:.2f}'
             })
-
-        scheduler.step()
         
         total_loss /= len(train_loader)
         total_pose_loss /= len(train_loader)
@@ -835,8 +877,6 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         total_motion_loss /= len(train_loader)
         total_rel_vel_loss /= len(train_loader)
         total_traj_loss /= len(train_loader)
-        total_accel_loss /=len(train_loader)
-        total_init_loss /=len(train_loader)
 
         # Evaluation
         model.eval()  # Set model to evaluation mode
@@ -848,8 +888,6 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         eval_motion_loss = 0
         eval_rel_vel_loss = 0
         eval_traj_loss = 0
-        eval_accel_loss=0
-        eval_init_loss=0
     
         # Progress bar for test batches
         eval_pbar = tqdm(
@@ -869,7 +907,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 model_output, mu, logvar = model(video_data)
 
                 # Compute loss
-                loss, pose_loss, R_loss, kl_loss, vel_loss, motion_loss, rel_vel_loss, traj_loss ,accel_loss, init_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R = lambda_R, lambda_kl = lambda_kl)
+                loss, pose_loss, R_loss, kl_loss, vel_loss, motion_loss, rel_vel_loss, traj_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl)
                 
                 loss_val = loss
                 pose_loss_val = pose_loss
@@ -879,8 +917,6 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 motion_loss_val = motion_loss
                 rel_vel_loss_val = rel_vel_loss
                 traj_loss_val = traj_loss
-                init_loss_val = init_loss
-                accel_loss_val= accel_loss
 
                 eval_loss += loss_val
                 eval_pose_loss += pose_loss_val
@@ -890,8 +926,6 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 eval_motion_loss += motion_loss_val
                 eval_rel_vel_loss += rel_vel_loss_val
                 eval_traj_loss += traj_loss_val
-                eval_accel_loss+= accel_loss_val
-                eval_init_loss+= init_loss_val
 
                 # Update progress bar
                 eval_pbar.set_postfix({
@@ -902,9 +936,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                     'vel_loss': f'{vel_loss_val:.2f}',
                     'motion_loss': f'{motion_loss_val:.2f}',
                     'rel_vel_loss': f'{rel_vel_loss_val:.2f}',
-                    'traj_loss': f'{traj_loss_val:.2f}',
-                    'accel': f'{accel_loss.item():.2f}',
-                    'init': f'{init_loss.item():.2f}'
+                    'traj_loss': f'{traj_loss_val:.2f}'
                 })
         eval_loss /= len(eval_loader)
         eval_pose_loss /= len(eval_loader)
@@ -914,9 +946,9 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         eval_motion_loss /= len(eval_loader)
         eval_rel_vel_loss /= len(eval_loader)
         eval_traj_loss /= len(eval_loader)
-        eval_init_loss/= len(eval_loader)
-        eval_accel_loss/= len(eval_loader)
-     
+
+        scheduler.step(eval_loss)
+
         # Check Overfitting
         if(eval_loss <= best_eval_loss):
             overfit = 0
@@ -938,17 +970,15 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             'time': f'{epoch_time:.1f}s'
         })
 
-        # lambda_R *= 1.5
-        # lambda_kl *= 0.9
+        lambda_kl *= 0.5
 
         # Print epoch summary
         print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s\n" 
               f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, R Loss: {total_R_loss:.5f}, "
-              f"KL Loss: {total_kl_loss:.5f}, Vel Loss: {total_vel_loss:.5f}, Accel Loss: {total_accel_loss:.5f}, Init Loss: {total_init_loss:.5f},  "
+              f"KL Loss: {total_kl_loss:.5f}, Vel Loss: {total_vel_loss:.5f}, "
               f"Motion Loss: {total_motion_loss:.5f}, Rel Vel Loss: {total_rel_vel_loss:.5f}, Traj Loss: {total_traj_loss:.5f}\n"
               f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, R Loss: {eval_R_loss:.5f}, "
-              f"KL Loss: {eval_kl_loss:.5f}, Vel Loss: {eval_vel_loss:.5f}, Accel Loss: {eval_accel_loss:.5f}, Init Loss: {eval_init_loss:.5f},  "
-              f"Motion Loss: {total_motion_loss:.5f}, Rel Vel Loss: {total_rel_vel_loss:.5f}, Traj Loss: {total_traj_loss:.5f}\n"
+              f"KL Loss: {eval_kl_loss:.5f}, Vel Loss: {eval_vel_loss:.5f}, "
               f"Motion Loss: {eval_motion_loss:.5f}, Rel Vel Loss: {eval_rel_vel_loss:.5f}, Traj Loss: {eval_traj_loss:.5f}")
         
     print(f"\nTraining completed in {num_epochs} epochs")
