@@ -332,10 +332,20 @@ class PoseVideoCNNRNN(nn.Module):
         nn.init.kaiming_normal_(self.fc_logvar[1].weight, mode='fan_in', nonlinearity='relu')
         nn.init.zeros_(self.fc_logvar[1].bias)
 
+        self.temporal_rnn2 = nn.LSTM(
+                input_size=32,
+                hidden_size=64,
+                num_layers=1,
+                batch_first=True,
+                bidirectional=False,
+            )
+
         # Final output layer for predicting joint values
         self.output_layer = nn.Sequential(
             nn.LeakyReLU(0.1),
-            nn.Linear(32, 26),  # Predicting 26 joint values for the robot
+            nn.Linear(64, 16),
+            nn.LeakyReLU(0.1),
+            nn.Linear(16, 6),
             nn.Sigmoid(),  # Using sigmoid for normalizing joint values
         )
         nn.init.xavier_normal_(self.output_layer[1].weight)
@@ -365,8 +375,10 @@ class PoseVideoCNNRNN(nn.Module):
         # Repeat the embedding for each frame in the sequence (15 frames)
         repeated = embedding.unsqueeze(1).repeat(1, 15, 1)  # Output: [batch_size, 15, 32]
 
-        # Final output layer to predict joint values
-        output = self.output_layer(repeated)  # Output: [batch_size, 15, 26]
+        rnn_out2, _ = self.temporal_rnn2(repeated)  # Shape: [batch_size, 15, 64]
+
+        # Output layer to get final 15x26 sequence
+        output = self.output_layer(rnn_out2)  # Output: [batch_size, 15, 26]
 
         # Debug print for output shapes
         print(f"output shape: {output.shape}, mu shape: {mu.shape}, logvar shape: {logvar.shape}")
