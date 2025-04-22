@@ -392,8 +392,8 @@ class PoseVideoCNNRNN(nn.Module):
         video = video.view(batch_size*seq_len, c, h, w)
         video = self.video_cnn(video)
         # print(video.mean(), video.std())
-        video = video.squeeze()
-        video = video.view(batch_size, seq_len, 128)
+        # video = video.squeeze()
+        video = video.view(batch_size, seq_len, -1)
 
         # First RNN (LSTM/GRU) for temporal modeling
         #_, (rnn_out, _) = self.temporal_rnn1(video)
