@@ -4,6 +4,8 @@ rasa/
 model_test/fig/
 model_test/fig_4/
 psl_venv/
+dataset/
+meshes/
 
 # Ignore specific file types
 *.pth
@@ -11,6 +13,7 @@ psl_venv/
 *.bundle
 *.zip
 *.ps1
+*.urdf
 
 # Standard ignores (recommended)
 *.pyc
