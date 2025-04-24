@@ -197,6 +197,7 @@ class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
+        # CNN for spatial feature extraction
         self.video_cnn = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm2d(32),
@@ -209,52 +210,89 @@ class PoseVideoCNNRNN(nn.Module):
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.1),
-            nn.AdaptiveAvgPool2d(1),  # Global Average Pooling
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1),
+            nn.AdaptiveAvgPool2d((4, 4)),  # Global Average Pooling
         )
+        for i in [0, 4, 8, 12]:
+            nn.init.kaiming_normal_(self.video_cnn[i].weight, mode='fan_in', nonlinearity='relu')
+            nn.init.zeros_(self.video_cnn[i].bias)
 
         # LSTM/GRU for temporal modeling
         self.temporal_rnn1 = nn.LSTM(
-                input_size=128,
-                hidden_size=32,
+                input_size=256*4*4,
+                hidden_size=128,
                 num_layers=1,
                 batch_first=True,
                 bidirectional=False,
             )
+        for name, param in self.temporal_rnn1.named_parameters():
+            if 'weight_ih' in name:  # Input-hidden weights
+                nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:  # Hidden-hidden weights (recurrent)
+                nn.init.orthogonal_(param.data)  # Helps with long-term dependencies
+            elif 'bias' in name:
+                nn.init.zeros_(param.data)  # Biases typically zero-initialized
+                # Optional: Initialize forget gate bias to 1 (helps with training)
+                if 'bias_hh' in name:
+                    param.data[128:256] = 1.0
 
-        self.L1 = nn.Sequential(
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.1),
-            nn.Linear(32, 16),
-            nn.LeakyReLU(0.1)
-        )
+        # self.L1 = nn.Sequential(
+        #     nn.LeakyReLU(0.1),
+        #     nn.Dropout(0.1),
+        #     nn.Linear(32, 16),
+        #     nn.LeakyReLU(0.1)
+        # )
+        # nn.init.kaiming_normal_(self.L1[2].weight, mode='fan_in', nonlinearity='relu')
+        # nn.init.zeros_(self.L1[2].bias)
 
         # Latent space projection
         self.fc_mu = nn.Sequential(
+            nn.LeakyReLU(0.1),
             nn.Dropout(0.1),
-            nn.Linear(16, 6),
+            nn.Linear(128, 64),
             nn.LeakyReLU(0.1),
         )
+        nn.init.kaiming_normal_(self.fc_mu[2].weight, mode='fan_in', nonlinearity='relu')
+        nn.init.zeros_(self.fc_mu[2].bias)
 
         self.fc_logvar = nn.Sequential(
+            nn.LeakyReLU(0.1),
             nn.Dropout(0.1),
-            nn.Linear(16, 6),
+            nn.Linear(128, 64),
             nn.LeakyReLU(0.1),
         )
+        nn.init.kaiming_normal_(self.fc_logvar[2].weight, mode='fan_in', nonlinearity='relu')
+        nn.init.zeros_(self.fc_logvar[2].bias)
         
         # Second LSTM/GRU layer for time series modeling
         self.temporal_rnn2 = nn.LSTM(
-                input_size=6,
-                hidden_size=16,
-                num_layers=1,
+                input_size=32,
+                hidden_size=32,
+                num_layers=2,
                 batch_first=True,
                 bidirectional=False,
             )
+        for name, param in self.temporal_rnn1.named_parameters():
+            if 'weight_ih' in name:  # Input-hidden weights
+                nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:  # Hidden-hidden weights (recurrent)
+                nn.init.orthogonal_(param.data)  # Helps with long-term dependencies
+            elif 'bias' in name:
+                nn.init.zeros_(param.data)  # Biases typically zero-initialized
+                # Optional: Initialize forget gate bias to 1 (helps with training)
+                if 'bias_hh' in name:
+                    param.data[16:32] = 1.0
 
         self.output_layer = nn.Sequential(
             nn.LeakyReLU(0.1),
-            nn.Linear(16, 6),
+            nn.Linear(32, 6),
             nn.Sigmoid(),
         )
+        nn.init.xavier_normal_(self.output_layer[1].weight)  # Xavier/Glorot initialization
+        nn.init.zeros_(self.output_layer[1].bias)  # Initialize bias to zeros
 
     def forward(self, video, deterministic=False):
         batch_size, seq_len, c, h, w = video.size()
@@ -264,14 +302,14 @@ class PoseVideoCNNRNN(nn.Module):
         video = video.view(batch_size*seq_len, c, h, w)
         video = self.video_cnn(video)
         # print(video.mean(), video.std())
-        video = video.squeeze()
-        video = video.view(batch_size, seq_len, 128)
+        # video = video.squeeze()
+        video = video.view(batch_size, seq_len, -1)
 
         # First RNN (LSTM/GRU) for temporal modeling
         #_, (rnn_out, _) = self.temporal_rnn1(video)
         _, (rnn_out, _) = self.temporal_rnn1(video)
         rnn_out = rnn_out.squeeze(0)
-        rnn_out = self.L1(rnn_out)
+        # rnn_out = self.L1(rnn_out)
 
         # Latent space
         mu = self.fc_mu(rnn_out)
@@ -284,17 +322,18 @@ class PoseVideoCNNRNN(nn.Module):
             embedding += torch.rand_like(std) * std
 
         # Repeat vector to 15x32
-        repeated = embedding.unsqueeze(1).repeat(1, 15, 1)  # Shape: [batch_size, 15, 32]
+        embedding = embedding.view(2, batch_size, 32)
+        decoder_input = torch.zeros(batch_size, seq_len, 32).to(device)
 
         # Second RNN for time series modeling
-        rnn_out2, _ = self.temporal_rnn2(repeated)  # Shape: [batch_size, 15, 64]
+        rnn_out2, _ = self.temporal_rnn2(decoder_input, (embedding, embedding))  # Shape: [batch_size, 15, 64]
 
         # Output layer to get final 15x26 sequence
         output = self.output_layer(rnn_out2)  # Shape: [batch_size, 15, 26]
         # output = torch.clamp(output, 0, 1)  # Apply clamp to ensure outputs are between 0 and 1
 
         return output, mu, logvar
-
+    
 class ForwardKinematics:
     def __init__(self, urdf_path):
         """
