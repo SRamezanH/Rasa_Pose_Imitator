@@ -87,6 +87,28 @@ def extract_zip(zip_file_path, extract_to_path):
         zip_ref.extractall(extract_to_path)
     print(f"Files extracted to {extract_to_path}")
 
+def batch_vectors_to_UV(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Convert two orthogonal vectors (u, v) on a plane to 6D rotation representation.
+    Args:
+        pose: Tensor of shape (B, N, 3, 3), first vector (e.g., palm's local x-axis).
+        eps: Small value to avoid division by zero.
+    Returns:
+        6D representation of shape (B, N, 6).
+    """
+    # Ensure u and v are unit vectors (optional but recommended)
+    root = pose[:,:,0]
+    u = pose[:,:,2] - root
+    u = u / (torch.norm(u, dim=-1, keepdim=True) + eps)
+    v = pose[:,:,1] - root
+    v = v / (torch.norm(v, dim=-1, keepdim=True) + eps)
+    
+    # Orthogonalize v w.r.t. u (Gram-Schmidt)
+    v_ortho = v - (torch.sum(u * v, dim=-1, keepdim=True) * u)
+    v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
+    
+    return torch.cat([root, u, v_ortho], dim=-1)
+
 # Module for processing protobuf data
 class ProtobufProcessor:
     @staticmethod
@@ -141,7 +163,7 @@ class ProtobufProcessor:
         landmarks = (landmarks - origin) / L  # Wrist as reference
 
         # Normalize hand landmarks
-        return landmarks[indices].unsqueeze(0)
+        return batch_vectors_to_UV(landmarks[indices].unsqueeze(0))
 
 
 # Dataset class for handling pose data
@@ -290,9 +312,12 @@ class ForwardKinematics:
                           torch.linalg.vector_norm((fk_result["right_Wrist"].get_matrix()[0, :3, 3]) - (fk_result["right_Forearm_1"].get_matrix()[0, :3, 3]))) / 2
                 origin = fk_result["right_Shoulder_2"].get_matrix()[0, :3, 3]
 
-                output_positions[b, t, 0] = (fk_result["right_Wrist"].get_matrix()[0, :3, 3] - origin) / body_L
-                output_positions[b, t, 1] = (fk_result["right_Finger_1_1"].get_matrix()[0, :3, 3] - origin) / body_L
-                output_positions[b, t, 2] = (fk_result["right_Finger_4_1"].get_matrix()[0, :3, 3] - origin) / body_L
+                pose = torch.zeros(3, 3).to(device)
+                pose[0] = (fk_result["right_Wrist"].get_matrix()[0, :3, 3] - origin) / body_L
+                pose[1] = (fk_result["right_Finger_1_1"].get_matrix()[0, :3, 3] - origin) / body_L
+                pose[2] = (fk_result["right_Finger_4_1"].get_matrix()[0, :3, 3] - origin) / body_L
+                output_positions[b, t] = batch_vectors_to_UV(pose)
+                
 
         return output_positions
 
@@ -391,7 +416,7 @@ def train_motion_gan(
     num_epochs,
     batch_size,
     learning_rate=1e-4,
-    latent_dim=100,
+    latent_dim=32,
     train_split=0.8,
     eval_split=0.2,
     model_prefix="motion_gan"
@@ -413,8 +438,9 @@ def train_motion_gan(
     print(f"Loaded dataset: {N} samples")
 
     train_n = int(train_split * N)
-    eval_n = N - train_n
-    train_ds, eval_ds = random_split(dataset, [train_n, eval_n])
+    eval_n = int(eval_split * N)
+    rest_n = N - train_n - eval_n
+    train_ds, eval_ds, _ = random_split(dataset, [train_n, eval_n, rest_n])
     print(f"Train size: {train_n}, Eval size: {eval_n}")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -489,8 +515,11 @@ def train_motion_gan(
 
         if avg_eval_loss < best_eval_loss:
             best_eval_loss = avg_eval_loss
-            torch.save(G.state_dict(), f"{model_prefix}_G_best.pth")
-            torch.save(D.state_dict(), f"{model_prefix}_D_best.pth")
+            torch.save(G.state_dict(), f"{model_prefix}_G_{epoch+1}_best.pth")
+            torch.save(D.state_dict(), f"{model_prefix}_D_{epoch+1}_best.pth")
+        else:
+            torch.save(G.state_dict(), f"{model_prefix}_G_{epoch+1}.pth")
+            torch.save(D.state_dict(), f"{model_prefix}_D_{epoch+1}.pth")
 
     print("✅ Training complete.")
 
