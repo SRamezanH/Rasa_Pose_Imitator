@@ -107,7 +107,7 @@ def batch_vectors_to_UV(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     v_ortho = v - (torch.sum(u * v, dim=-1, keepdim=True) * u)
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
     
-    return torch.cat([root, u, v_ortho], dim=-1)
+    return torch.cat([root, u, v_ortho], dim=0).unsqueeze(0)
 
 # Module for processing protobuf data
 class ProtobufProcessor:
@@ -312,10 +312,10 @@ class ForwardKinematics:
                           torch.linalg.vector_norm((fk_result["right_Wrist"].get_matrix()[0, :3, 3]) - (fk_result["right_Forearm_1"].get_matrix()[0, :3, 3]))) / 2
                 origin = fk_result["right_Shoulder_2"].get_matrix()[0, :3, 3]
 
-                pose = torch.zeros(3, 3).to(device)
-                pose[0] = (fk_result["right_Wrist"].get_matrix()[0, :3, 3] - origin) / body_L
-                pose[1] = (fk_result["right_Finger_1_1"].get_matrix()[0, :3, 3] - origin) / body_L
-                pose[2] = (fk_result["right_Finger_4_1"].get_matrix()[0, :3, 3] - origin) / body_L
+                pose = torch.zeros(1, 3, 3).to(device)
+                pose[0, 0] = (fk_result["right_Wrist"].get_matrix()[0, :3, 3] - origin) / body_L
+                pose[0, 1] = (fk_result["right_Finger_1_1"].get_matrix()[0, :3, 3] - origin) / body_L
+                pose[0, 2] = (fk_result["right_Finger_4_1"].get_matrix()[0, :3, 3] - origin) / body_L
                 output_positions[b, t] = batch_vectors_to_UV(pose)
                 
 
@@ -463,7 +463,9 @@ def train_motion_gan(
         running_D_loss = 0.0
         running_G_loss = 0.0
 
-        for real in tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}", leave=False):
+        batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}", leave=False)
+
+        for real in batch_pbar:
             real = real.to(device)
             B = real.size(0)
             valid = torch.ones(B, 1, device=device)
@@ -497,6 +499,11 @@ def train_motion_gan(
 
             running_D_loss += d_loss.item()
             running_G_loss += total_g_loss.item()
+
+            batch_pbar.set_postfix({
+                'D_Loss': f'{d_loss.item():.4f}', 
+                'G_Loss': f'{total_g_loss.item():.4f}'
+            })
 
         avg_D_loss = running_D_loss / len(train_loader)
         avg_G_loss = running_G_loss / len(train_loader)
