@@ -144,139 +144,66 @@ class ProtobufProcessor:
         return landmarks[indices].unsqueeze(0)
 
 
-# Dataset class for handling video and pose data
-class PoseVideoDataset(Dataset):
+# Dataset class for handling pose data
+class PoseDataset(Dataset):
     def __init__(self, root_dir, transform=None, validate_files=True):
-        """
-        Args:
-            root_dir (string): Directory with all the videos and protobuf files
-            transform (callable, optional): Optional transform to be applied on samples
-            validate_files (bool): Whether to validate files during initialization
-        """
         self.root_dir = root_dir
         self.transform = transform
-        self.video_files = sorted(glob.glob(os.path.join(root_dir, "*.mp4")))
+        self.pb_files = sorted(glob.glob(os.path.join(root_dir, "*.pb")))
         self.valid_indices = []
-        self.print_warnings = True
         
         if validate_files:
-            print("Validating video files...")
-            # Use tqdm if available for progress bar
+            print("Validating pose files...")
             try:
                 from tqdm import tqdm
-                iterator = tqdm(enumerate(self.video_files), total=len(self.video_files), desc="Validating videos")
+                iterator = tqdm(enumerate(self.pb_files), total=len(self.pb_files), desc="Validating files")
             except ImportError:
-                iterator = enumerate(self.video_files)
+                iterator = enumerate(self.pb_files)
                 
-            for i, video_path in iterator:
-                pb_path = video_path.replace(".mp4", ".pb")
+            for i, pb_path in iterator:
                 is_valid = True
                 
-                # Check if video file can be opened
                 try:
-                    video_test, _, _ = read_video(video_path ,output_format="TCHW")
-                    is_valid == video_test.shape[0] == 15
-                    
-                    # Check if protobuf file exists and can be loaded
-                    if is_valid and not os.path.exists(pb_path):
-                        if self.print_warnings:
-                            print(f"Warning: Missing protobuf file for {video_path}")
-                        is_valid = False
-                    
+                    ProtobufProcessor.load_protobuf_data(pb_path)
                 except Exception as e:
-                    if self.print_warnings:
-                        print(f"Warning: Error validating {video_path}: {str(e)}")
+                    print(f"Warning: Error validating {pb_path}: {str(e)}")
                     is_valid = False
                 
                 if is_valid:
                     self.valid_indices.append(i)
             
-            print(f"Found {len(self.valid_indices)} valid videos out of {len(self.video_files)} total videos")
+            print(f"Found {len(self.valid_indices)} valid files out of {len(self.pb_files)} total files")
         else:
-            # If not validating, assume all files are valid
-            self.valid_indices = list(range(len(self.video_files)))
+            self.valid_indices = list(range(len(self.pb_files)))
 
     def __len__(self):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        # Get the actual file index from valid_indices list
         file_idx = self.valid_indices[idx]
-        # Load video file
-        video_path = self.video_files[file_idx]
-
-        # Derive protobuf path from video path
-        pb_path = video_path.replace(".mp4", ".pb")
-
-        # Load video frames - no try/except as we've pre-validated
-        video_data = self._load_video(video_path)
-
-        # Load pose data from protobuf
+        pb_path = self.pb_files[file_idx]
         pose_data = self._load_protobuf(pb_path)
-
-        sample = {"video": video_data, "pose": pose_data}
-
-        if self.transform:
-            sample = self.transform(sample)
-
-        return sample
-
-    def _load_video(self, video_path):
-        """
-        Load and process video frames using OpenCV.
-
-        Args:
-            video_path (string): Path to the video file
-
-        Returns:
-            torch.Tensor: Tensor containing video frames with shape  [15, 3, 273, 210]
-        """
-        # Open the video file
-        video, _, _ = read_video(video_path ,output_format="TCHW")
-        video_tensor = video.to(device)
-        video_tensor = video_tensor[:15, :3, :210, :273]
-        num_frames, ch, w, h = video_tensor.shape
-        if num_frames < 15:
-            print("Low frame count" + video_path)
-            padding = torch.zeros([15 - num_frames, ch, w, h ]).to(device)
-            video_tensor = torch.cat((video_tensor, padding), dim=0)
-
-        return video_tensor.permute(0,1,3,2) / 255.0
+        return pose_data
 
     def _load_protobuf(self, pb_path):
-        """
-        Load and process protobuf file containing pose data.
-
-        Args:
-            pb_path (string): Path to the protobuf file
-
-        Returns:
-            torch.Tensor: Tensor containing pose data with shape [15, feature_size]
-                         where feature_size is the total number of landmarks * 3 (x, y, z)
-        """
         proto_data = ProtobufProcessor.load_protobuf_data(pb_path)
         left_side = pb_path.endswith("_left.pb")
 
         pose_tensor = torch.empty([0, 3, 3], dtype=torch.float32)
 
         for frame in proto_data.frames:
-            # Extract and normalize landmarks for body, left hand, and right hand
             pose_landmarks = ProtobufProcessor.extract_landmark_coordinates(
                 frame, "pose_landmarks", range(10)
-            )  # Body landmarks
+            )
             
-            # Normalize the extracted landmarks
             selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
-
             pose_tensor = torch.cat((pose_tensor, selected_landmarks), dim=0)
 
         pose_tensor = pose_tensor.to(device)
 
-        # Ensure we have exactly 15 frames
         num_frames, feature_size, dim_size = pose_tensor.shape
         if num_frames < 15:
-            print("Low frame count" + pb_path)
-            padding = torch.zeros([15 - num_frames, feature_size, dim_size ]).to(device)
+            padding = torch.zeros([15 - num_frames, feature_size, dim_size]).to(device)
             pose_tensor = torch.cat((pose_tensor, padding), dim=0)
         elif num_frames > 15:
             pose_tensor = pose_tensor[:15, :, :]
@@ -478,7 +405,7 @@ def train_motion_gan(
         print(f"  - CUDA Capability: {props.major}.{props.minor}")
         print(f"  - Total Memory: {props.total_memory/1024**3:.1f} GB")
 
-    dataset = PoseVideoDataset(root_dir=data_dir, validate_files=True)
+    dataset = PoseDataset(root_dir=data_dir, validate_files=True)
     N = len(dataset)
     if N == 0:
         print("❌ No valid .pb samples found.")
@@ -510,8 +437,8 @@ def train_motion_gan(
         running_D_loss = 0.0
         running_G_loss = 0.0
 
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}", leave=False):
-            real = batch["pose"].to(device)
+        for real in tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}", leave=False):
+            real = real.to(device)
             B = real.size(0)
             valid = torch.ones(B, 1, device=device)
             fake = torch.zeros(B, 1, device=device)
@@ -552,8 +479,8 @@ def train_motion_gan(
         D.eval()
         eval_loss = 0.0
         with torch.no_grad():
-            for batch in eval_loader:
-                real = batch["pose"].to(device)
+            for real in eval_loader:
+                real = real.to(device)
                 pred = D(real)
                 eval_loss += criterion(pred, torch.ones_like(pred)).item()
         avg_eval_loss = eval_loss / len(eval_loader)
@@ -585,7 +512,7 @@ def test_dataset(data_dir: str):
     print(f"Found {len(pb_files)} .pb files")
 
     try:
-        dataset = PoseVideoDataset(root_dir=data_dir, validate_files=False)
+        dataset = PoseDataset(root_dir=data_dir, validate_files=False)
         n = len(dataset)
         print(f"Loaded dataset with {n} samples ({n/len(pb_files)*100:.1f}% valid)")
     except Exception as e:
