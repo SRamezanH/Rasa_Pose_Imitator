@@ -388,17 +388,24 @@ class PoseVideoCNNRNN(nn.Module):
             nn.BatchNorm1d(256),
             nn.LeakyReLU(0.2)
         )
-        self.gru = nn.GRU(256, 128, bidirectional=True, batch_first=True)
-        self.attn = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.Tanh(),
-            nn.Linear(128, 1, bias=False),
-            nn.Softmax(dim=1)
-        )
+        # self.gru = nn.GRU(256, 128, bidirectional=True, batch_first=True)
+        # self.attn = nn.Sequential(
+        #     nn.Linear(256, 128),
+        #     nn.Tanh(),
+        #     nn.Linear(128, 1, bias=False),
+        #     nn.Softmax(dim=1)
+        # )
+        # self.joint_fc = nn.Sequential(
+        #     nn.Linear(256, 64),
+        #     nn.LeakyReLU(0.2),
+        #     nn.Linear(64, 6),
+        #     nn.Sigmoid()
+        # )
+
         self.joint_fc = nn.Sequential(
-            nn.Linear(256, 64),
+            nn.Linear(256, 128),
             nn.LeakyReLU(0.2),
-            nn.Linear(64, 6),
+            nn.Linear(128, 90),
             nn.Sigmoid()
         )
 
@@ -440,11 +447,12 @@ class PoseVideoCNNRNN(nn.Module):
         # output = self.output_layer(rnn_out2)  # Shape: [batch_size, 15, 26]
         # output = torch.clamp(output, 0, 1)  # Apply clamp to ensure outputs are between 0 and 1
 
-        h = self.fc(embedding).unsqueeze(1).repeat(1, 15, 1)
-        gru_out, _ = self.gru(h)                  # [B, seq_len, 512]
-        w = self.attn(gru_out)                    # [B, seq_len, 1]
-        c = torch.sum(w * gru_out, dim=1, keepdim=True)
-        output = self.joint_fc(gru_out + c)       # [B, seq_len, joint_dim=6]
+        h = self.fc(embedding)#.unsqueeze(1).repeat(1, 15, 1)
+        # gru_out, _ = self.gru(h)                  # [B, seq_len, 512]
+        # w = self.attn(gru_out)                    # [B, seq_len, 1]
+        # c = torch.sum(w * gru_out, dim=1, keepdim=True)
+        # output = self.joint_fc(gru_out + c)       # [B, seq_len, joint_dim=6]
+        output = self.joint_fc(h).view(-1, 15, 6)       # [B, seq_len, joint_dim=6]
 
         return output, mu, logvar
 
