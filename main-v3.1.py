@@ -357,55 +357,26 @@ class PoseVideoCNNRNN(nn.Module):
         nn.init.kaiming_normal_(self.fc_logvar[2].weight, mode='fan_in', nonlinearity='relu')
         nn.init.zeros_(self.fc_logvar[2].bias)
         
-        # # Second LSTM/GRU layer for time series modeling
-        # self.temporal_rnn2 = nn.LSTM(
-        #         input_size=32,
-        #         hidden_size=32,
-        #         num_layers=2,
-        #         batch_first=True,
-        #         bidirectional=False,
-        #     )
-        # for name, param in self.temporal_rnn1.named_parameters():
-        #     if 'weight_ih' in name:  # Input-hidden weights
-        #         nn.init.xavier_uniform_(param.data)
-        #     elif 'weight_hh' in name:  # Hidden-hidden weights (recurrent)
-        #         nn.init.orthogonal_(param.data)  # Helps with long-term dependencies
-        #     elif 'bias' in name:
-        #         nn.init.zeros_(param.data)  # Biases typically zero-initialized
-        #         # Optional: Initialize forget gate bias to 1 (helps with training)
-        #         if 'bias_hh' in name:
-        #             param.data[16:32] = 1.0
+        # Decoder
+        self.hidden_dim = 256
+        self.input_dim = 64
+        self.joint_dim = 6
+        self.noise_dim = 4
+        self.total_input_dim = self.input_dim + self.joint_dim + self.noise_dim + 1  # z + prev_frame + noise + time
 
-        # self.output_layer = nn.Sequential(
-        #     nn.LeakyReLU(0.1),
-        #     nn.Linear(32, 6),
-        #     nn.Sigmoid(),
-        # )
-        # nn.init.xavier_normal_(self.output_layer[1].weight)  # Xavier/Glorot initialization
-        # nn.init.zeros_(self.output_layer[1].bias)  # Initialize bias to zeros
-        self.fc = nn.Sequential(
-            nn.Linear(64, 256),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.2)
+        self.fc_in = nn.Linear(self.total_input_dim, self.hidden_dim)
+        
+        self.gru = nn.GRU(
+            input_size=self.hidden_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=1,
+            batch_first=True
         )
-        # self.gru = nn.GRU(256, 128, bidirectional=True, batch_first=True)
-        # self.attn = nn.Sequential(
-        #     nn.Linear(256, 128),
-        #     nn.Tanh(),
-        #     nn.Linear(128, 1, bias=False),
-        #     nn.Softmax(dim=1)
-        # )
-        # self.joint_fc = nn.Sequential(
-        #     nn.Linear(256, 64),
-        #     nn.LeakyReLU(0.2),
-        #     nn.Linear(64, 6),
-        #     nn.Sigmoid()
-        # )
-
+        
         self.joint_fc = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(self.hidden_dim, 64),
             nn.LeakyReLU(0.2),
-            nn.Linear(128, 90),
+            nn.Linear(64, self.joint_dim),
             nn.Sigmoid()
         )
 
@@ -436,25 +407,37 @@ class PoseVideoCNNRNN(nn.Module):
             std = torch.exp(0.5 * logvar)
             embedding += torch.rand_like(std) * std
 
-        # Repeat vector to 15x32
-        # embedding = embedding.view(2, batch_size, 32)
-        # decoder_input = torch.zeros(batch_size, seq_len, 32).to(device)
+        h = None  # hidden state for GRU
+        outputs = []
+        noise_std = 0.1 if not deterministic else 0.01
+        
+        # Initial previous frame: zeros (assume rest position)
+        prev_frame = torch.zeros(batch_size, self.joint_dim, device=device)
 
-        # # Second RNN for time series modeling
-        # rnn_out2, _ = self.temporal_rnn2(decoder_input, (embedding, embedding))  # Shape: [batch_size, 15, 64]
+        for t in range(seq_len):
+            # Generate small random noise per frame
+            noise = torch.randn(batch_size, self.noise_dim, device=device) * noise_std
 
-        # # Output layer to get final 15x26 sequence
-        # output = self.output_layer(rnn_out2)  # Shape: [batch_size, 15, 26]
-        # output = torch.clamp(output, 0, 1)  # Apply clamp to ensure outputs are between 0 and 1
+            # Normalized time step
+            time_step = torch.full((batch_size, 1), t / (seq_len - 1), device=device)
 
-        h = self.fc(embedding)#.unsqueeze(1).repeat(1, 15, 1)
-        # gru_out, _ = self.gru(h)                  # [B, seq_len, 512]
-        # w = self.attn(gru_out)                    # [B, seq_len, 1]
-        # c = torch.sum(w * gru_out, dim=1, keepdim=True)
-        # output = self.joint_fc(gru_out + c)       # [B, seq_len, joint_dim=6]
-        output = self.joint_fc(h).view(-1, 15, 6)       # [B, seq_len, joint_dim=6]
+            # Concatenate inputs
+            input_vec = torch.cat([embedding, prev_frame, noise, time_step], dim=-1).unsqueeze(1)  # (batch_size, 1, total_input_dim)
 
-        return output, mu, logvar
+            # Process through GRU
+            x = self.fc_in(input_vec)
+            out, h = self.gru(x, h)  # maintain hidden state h
+            frame = self.joint_fc(out.squeeze(1))  # (batch_size, joint_dim)
+
+            outputs.append(frame)
+
+            # Update previous frame
+            prev_frame = frame
+
+        # Stack outputs along time axis
+        outputs = torch.stack(outputs, dim=1)  # (batch_size, output_frames, joint_dim)
+
+        return outputs, mu, logvar
 
 
 class ForwardKinematics:
