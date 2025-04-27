@@ -228,13 +228,14 @@ class PoseVideoDataset(Dataset):
         video, _, _ = read_video(video_path ,output_format="TCHW")
         video_tensor = video.to(device)
         video_tensor = video_tensor[:15, :3, :210, :273]
-        num_frames, ch, w, h = video_tensor.shape
+        num_frames, ch, h, w = video_tensor.shape
         if num_frames < 15:
             print("Low frame count" + video_path)
-            padding = torch.zeros([15 - num_frames, ch, w, h ]).to(device)
+            padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
             video_tensor = torch.cat((video_tensor, padding), dim=0)
 
-        return video_tensor.permute(0,1,2,3) / 255.0
+        #return video_tensor.permute(0,1,3,2) / 255.0
+        return video_tensor / 255.0
 
     def _load_protobuf(self, pb_path):
         """
@@ -354,7 +355,7 @@ class PoseVideoCNNRNN(nn.Module):
         # CNN feature extraction
         video = video.view(batch_size*seq_len, c, h, w)
         video = self.video_cnn(video)
-        video = video.view(batch_size, seq_len, -1)
+        video = video.reshape(batch_size, seq_len, -1)
 
         # First RNN (LSTM/GRU) for temporal modeling
         _, (rnn_out, _) = self.temporal_rnn1(video)
@@ -402,6 +403,37 @@ class PoseVideoCNNRNN(nn.Module):
 
         return outputs, mu, logvar
 
+#     def batch_forward_kinematics(self, batch_joint_values):
+#         """
+#         Optimized batch forward kinematics
+#         Input: batch_joint_values - tensor [batch_size, seq_len, num_joints]
+#         Output: normalized positions tensor [batch_size, seq_len, 3, 3]
+#         """
+#         batch_size, seq_len, num_joints = batch_joint_values.shape
+        
+#         # Denormalize joint values in vectorized form
+#         joints = (batch_joint_values * self.joint_ranges) + self.joint_lowers
+        
+#         # Reshape for batch processing [batch*seq, num_joints]
+#         joints_flat = joints.view(-1, num_joints)
+        
+#         # Batch forward kinematics [batch*seq, 4, 4]
+#         fk_results = self.robot_chain.forward(joints_flat)
+        
+#         # Extract positions and reshape
+#         wrist_pos = fk_results[..., :3, 3].view(batch_size, seq_len, 3)
+#         finger1_pos = fk_results["right_Finger_1_1"][..., :3, 3].view(batch_size, seq_len, 3)
+#         finger4_pos = fk_results["right_Finger_4_1"][..., :3, 3].view(batch_size, seq_len, 3)
+        
+#         # Normalize positions using precomputed reference
+#         normalized_positions = torch.stack([
+#             (wrist_pos - fk_results["right_Shoulder_2"][..., :3, 3]) / self.L_ref,
+#             (finger1_pos - fk_results["right_Shoulder_2"][..., :3, 3]) / self.L_ref,
+#             (finger4_pos - fk_results["right_Shoulder_2"][..., :3, 3]) / self.L_ref,
+#         ], dim=2)
+        
+#         return normalized_positions
+
 class ForwardKinematics:
     def __init__(self, urdf_path):
         """
@@ -411,6 +443,9 @@ class ForwardKinematics:
             urdf_path (str): Path to the URDF file
         """
         self.urdf_path = urdf_path
+        self.robot_chain = None
+        self.all_joints = None
+        self.joint_limits = {}
         self.selected_joints = [
             "right_Shoulder_1",
             "right_Shoulder_2",
@@ -419,41 +454,52 @@ class ForwardKinematics:
             "right_Elbow_2",
             "right_Wrist"
         ]
-        
-        # Preprocess during initialization
-        self._load_robot()
+
+        self.load_robot()
         self._precompute_body_references()
 
-    def _load_robot(self):
-        """Load robot model and joint limits once during initialization"""
+    def load_robot(self):
+        """Load robot model from URDF file and extract joint limits"""
+        # Load URDF and build kinematic chain
         with open(self.urdf_path, "r") as f:
             urdf_content = f.read()
+        self.robot_chain = pk.build_chain_from_urdf(urdf_content)
+        self.all_joints = self.robot_chain.get_joint_parameter_names()
+
+        # Extract joint limits
+        tree = ET.parse(self.urdf_path)
+        root = tree.getroot()
+        for joint in root.findall("joint"):
+            joint_name = joint.get("name")
+            limit = joint.find("limit")
+            if limit is not None and joint_name in self.all_joints:
+                lower = float(limit.get("lower", "0"))
+                upper = float(limit.get("upper", "0"))
+                self.joint_limits[joint_name] = (lower, upper)
         
-        # Build kinematic chain
-        self.robot_chain = pk.build_serial_chain_from_urdf(
-            urdf_content,
-            end_link_name="right_Wrist",  # Assuming wrist is end effector
-            root_link_name="base_link"     # Adjust according to URDF
-        )
-        
-        # Get joint limits as tensors
-        all_limits = self.robot_chain.get_joint_limits()
-        self.joint_lowers = torch.tensor([all_limits[j][0] for j in self.selected_joints],
-                                        device=device)
-        self.joint_uppers = torch.tensor([all_limits[j][1] for j in self.selected_joints],
-                                        device=device)
+        self.selected_indices = [
+            self.all_joints.index(j) 
+            for j in self.selected_joints 
+            if j in self.all_joints
+        ]
+
+        # Convert to tensors in order of selected_joints
+        self.joint_lowers = torch.tensor([self.joint_limits[j][0] for j in self.selected_joints])
+        self.joint_uppers = torch.tensor([self.joint_limits[j][1] for j in self.selected_joints])
         self.joint_ranges = self.joint_uppers - self.joint_lowers
+
+        print("Kinematic chain initialized")
 
     def _precompute_body_references(self):
         """Precompute reference points and lengths using zero joint angles"""
         with torch.no_grad():
-            zero_joints = torch.zeros(len(self.selected_joints), device=device)
-            fk_result = self.robot_chain.forward(zero_joints)
+            zero_joints = torch.zeros(len(self.all_joints))
+            fk_result = self.robot_chain.forward_kinematics(zero_joints)
             
             # Precompute reference points
-            shoulder_pos = fk_result["right_Shoulder_2"][:3, 3]
-            forearm_pos = fk_result["right_Forearm_1"][:3, 3]
-            wrist_pos = fk_result["right_Wrist"][:3, 3]
+            shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+            forearm_pos = fk_result["right_Forearm_1"].get_matrix()[:, :3, 3]
+            wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
             
             # Calculate reference length
             self.L_ref = (torch.norm(shoulder_pos - forearm_pos) + 
@@ -461,34 +507,37 @@ class ForwardKinematics:
 
     def batch_forward_kinematics(self, batch_joint_values):
         """
-        Optimized batch forward kinematics
-        Input: batch_joint_values - tensor [batch_size, seq_len, num_joints]
-        Output: normalized positions tensor [batch_size, seq_len, 3, 3]
+        Compute forward kinematics for a batch of joint values
+
+        Args:
+            batch_joint_values (torch.Tensor): Tensor with shape [batch_size, seq_len, num_joints]
+                containing joint values
+
+        Returns:
+            torch.Tensor: Tensor with shape [batch_size, seq_len, num_links*3] containing 3D positions
+                of important links
         """
-        batch_size, seq_len, num_joints = batch_joint_values.shape
+        batch_size, seq_len, _ = batch_joint_values.shape
+
+        denormalized = (batch_joint_values.cpu() * self.joint_ranges) + self.joint_lowers
+        full_joints = torch.zeros((batch_size, seq_len, len(self.all_joints)))
+        full_joints[:, :, self.selected_indices] = denormalized
+        joints_flat = full_joints.view(-1, len(self.all_joints))
+        fk_result = self.robot_chain.forward_kinematics(joints_flat)
         
-        # Denormalize joint values in vectorized form
-        joints = (batch_joint_values * self.joint_ranges) + self.joint_lowers
+        # 4. Extract and normalize positions
+        shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+        wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
+        finger1_pos = fk_result["right_Finger_1_1"].get_matrix()[:, :3, 3]
+        finger4_pos = fk_result["right_Finger_4_1"].get_matrix()[:, :3, 3]
         
-        # Reshape for batch processing [batch*seq, num_joints]
-        joints_flat = joints.view(-1, num_joints)
+        normalized = torch.stack([
+            (wrist_pos - shoulder_pos) / self.L_ref,
+            (finger1_pos - shoulder_pos) / self.L_ref,
+            (finger4_pos - shoulder_pos) / self.L_ref,
+        ], dim=2).view(batch_size, seq_len, 3, 3)
         
-        # Batch forward kinematics [batch*seq, 4, 4]
-        fk_results = self.robot_chain.forward(joints_flat)
-        
-        # Extract positions and reshape
-        wrist_pos = fk_results[..., :3, 3].view(batch_size, seq_len, 3)
-        finger1_pos = fk_results["right_Finger_1_1"][..., :3, 3].view(batch_size, seq_len, 3)
-        finger4_pos = fk_results["right_Finger_4_1"][..., :3, 3].view(batch_size, seq_len, 3)
-        
-        # Normalize positions using precomputed reference
-        normalized_positions = torch.stack([
-            (wrist_pos - fk_results["right_Shoulder_2"][..., :3, 3]) / self.L_ref,
-            (finger1_pos - fk_results["right_Shoulder_2"][..., :3, 3]) / self.L_ref,
-            (finger4_pos - fk_results["right_Shoulder_2"][..., :3, 3]) / self.L_ref,
-        ], dim=2)
-        
-        return normalized_positions
+        return normalized.to(device)
 
 def test_dataset(data_dir):
     """
@@ -603,73 +652,6 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     six_d = torch.cat([u, v_ortho], dim=-1)
     return six_d
 
-def frechet_distance(pred, target):
-    """
-    Computes the discrete Fréchet distance between two trajectories.
-    Args:
-        pred: (batch, seq_len, 3) - Predicted wrist positions.
-        target: (batch, seq_len, 3) - Ground truth wrist positions.
-    Returns:
-        (batch,) - Fréchet distance per sample.
-    """
-    batch_size, seq_len, _ = pred.shape
-    frechet_dist = torch.zeros(batch_size, device=pred.device)
-    
-    for i in range(batch_size):
-        # Pairwise Euclidean distance matrix
-        dist_matrix = torch.cdist(pred[i], target[i], p=2)  # (seq_len, seq_len)
-        
-        # Initialize DP table (avoid inplace)
-        C = torch.zeros((seq_len, seq_len), device=pred.device)
-        C = C.clone()  # Ensure no inplace ops
-        
-        # Fill first cell
-        C = torch.where(
-            (torch.arange(seq_len, device=pred.device) == 0).unsqueeze(1) &
-            (torch.arange(seq_len, device=pred.device) == 0).unsqueeze(0),
-            dist_matrix[0, 0],
-            C
-        )
-        
-        # Fill first row (j > 0)
-        for j in range(1, seq_len):
-            mask = (torch.arange(seq_len, device=pred.device) == 0).unsqueeze(1) & \
-                   (torch.arange(seq_len, device=pred.device) == j).unsqueeze(0)
-            C = torch.where(
-                mask,
-                torch.maximum(C[0, j-1], dist_matrix[0, j]),
-                C
-            )
-        
-        # Fill first column (k > 0)
-        for k in range(1, seq_len):
-            mask = (torch.arange(seq_len, device=pred.device) == k).unsqueeze(1) & \
-                   (torch.arange(seq_len, device=pred.device) == 0).unsqueeze(0)
-            C = torch.where(
-                mask,
-                torch.maximum(C[k-1, 0], dist_matrix[k, 0]),
-                C
-            )
-        
-        # Fill the rest of the table (k > 0, j > 0)
-        for k in range(1, seq_len):
-            for j in range(1, seq_len):
-                mask = (torch.arange(seq_len, device=pred.device) == k).unsqueeze(1) & \
-                       (torch.arange(seq_len, device=pred.device) == j).unsqueeze(0)
-                min_prev = torch.minimum(
-                    torch.minimum(C[k-1, j], C[k, j-1]),
-                    C[k-1, j-1]
-                )
-                C = torch.where(
-                    mask,
-                    torch.maximum(min_prev, dist_matrix[k, j]),
-                    C
-                )
-        
-        frechet_dist[i] = C[-1, -1]
-    
-    return frechet_dist
-
 def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
     """
     Computes the loss between the predicted and actual pose data
@@ -704,7 +686,7 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1
     # Velocity loss - matches the velocity profiles
     velocity_in = torch.diff(pose_data[:,:,0], dim=1)  # [batch, 14, 3]
     velocity_out = torch.diff(kine_output[:,:,0], dim=1)  # [batch, 14, 3]
-    dir_loss = 1 - F.cosine_similarity(velocity_in, velocity_out, dim=-1)
+    dir_loss = 1.0 - F.cosine_similarity(velocity_in, velocity_out, dim=-1).mean()
     vel_loss = 30.0 * mse_loss(velocity_in, velocity_out)
     
     # Combine all loss terms with their respective weights
@@ -792,7 +774,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 col_names=["input_size", "output_size", "num_params", "kernel_size", "mult_adds"],
                 col_width=20,
                 row_settings=["var_names", "depth"],
-                verbose=1
+                verbose=0
                 )
             if model_stats:
                 print(f"\nTotal Parameters: {model_stats.total_params:,}")
