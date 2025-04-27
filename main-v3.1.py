@@ -640,7 +640,7 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
 
 def frechet_distance(pred, target):
     """
-    Compute the discrete Fréchet distance between two trajectories.
+    Computes the discrete Fréchet distance between two trajectories.
     Args:
         pred: (batch, seq_len, 3) - Predicted wrist positions.
         target: (batch, seq_len, 3) - Ground truth wrist positions.
@@ -651,26 +651,54 @@ def frechet_distance(pred, target):
     frechet_dist = torch.zeros(batch_size, device=pred.device)
     
     for i in range(batch_size):
-        # Compute pairwise Euclidean distance matrix
+        # Pairwise Euclidean distance matrix
         dist_matrix = torch.cdist(pred[i], target[i], p=2)  # (seq_len, seq_len)
         
-        # Dynamic programming to compute Frechet distance
+        # Initialize DP table (avoid inplace)
         C = torch.zeros((seq_len, seq_len), device=pred.device)
-        C[0, 0] = dist_matrix[0, 0]
+        C = C.clone()  # Ensure no inplace ops
         
+        # Fill first cell
+        C = torch.where(
+            (torch.arange(seq_len, device=pred.device) == 0).unsqueeze(1) &
+            (torch.arange(seq_len, device=pred.device) == 0).unsqueeze(0),
+            dist_matrix[0, 0],
+            C
+        )
+        
+        # Fill first row (j > 0)
         for j in range(1, seq_len):
-            C[0, j] = torch.max(C[0, j-1], dist_matrix[0, j])
+            mask = (torch.arange(seq_len, device=pred.device) == 0).unsqueeze(1) & \
+                   (torch.arange(seq_len, device=pred.device) == j).unsqueeze(0)
+            C = torch.where(
+                mask,
+                torch.maximum(C[0, j-1], dist_matrix[0, j]),
+                C
+            )
         
+        # Fill first column (k > 0)
         for k in range(1, seq_len):
-            C[k, 0] = torch.max(C[k-1, 0], dist_matrix[k, 0])
+            mask = (torch.arange(seq_len, device=pred.device) == k).unsqueeze(1) & \
+                   (torch.arange(seq_len, device=pred.device) == 0).unsqueeze(0)
+            C = torch.where(
+                mask,
+                torch.maximum(C[k-1, 0], dist_matrix[k, 0]),
+                C
+            )
         
+        # Fill the rest of the table (k > 0, j > 0)
         for k in range(1, seq_len):
             for j in range(1, seq_len):
-                C[k, j] = torch.max(
-                    torch.min(
-                        torch.stack([C[k-1, j], C[k, j-1], C[k-1, j-1]])
-                    ),
-                    dist_matrix[k, j]
+                mask = (torch.arange(seq_len, device=pred.device) == k).unsqueeze(1) & \
+                       (torch.arange(seq_len, device=pred.device) == j).unsqueeze(0)
+                min_prev = torch.minimum(
+                    torch.minimum(C[k-1, j], C[k, j-1]),
+                    C[k-1, j-1]
+                )
+                C = torch.where(
+                    mask,
+                    torch.maximum(min_prev, dist_matrix[k, j]),
+                    C
                 )
         
         frechet_dist[i] = C[-1, -1]
