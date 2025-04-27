@@ -267,32 +267,28 @@ class PoseVideoCNNRNN(nn.Module):
         nn.init.kaiming_normal_(self.fc_logvar[2].weight, mode='fan_in', nonlinearity='relu')
         nn.init.zeros_(self.fc_logvar[2].bias)
         
-        # Second LSTM/GRU layer for time series modeling
-        self.temporal_rnn2 = nn.LSTM(
-                input_size=32,
-                hidden_size=32,
-                num_layers=2,
-                batch_first=True,
-                bidirectional=False,
-            )
-        for name, param in self.temporal_rnn1.named_parameters():
-            if 'weight_ih' in name:  # Input-hidden weights
-                nn.init.xavier_uniform_(param.data)
-            elif 'weight_hh' in name:  # Hidden-hidden weights (recurrent)
-                nn.init.orthogonal_(param.data)  # Helps with long-term dependencies
-            elif 'bias' in name:
-                nn.init.zeros_(param.data)  # Biases typically zero-initialized
-                # Optional: Initialize forget gate bias to 1 (helps with training)
-                if 'bias_hh' in name:
-                    param.data[16:32] = 1.0
+        # Decoder
+        self.hidden_dim = 256
+        self.input_dim = 64
+        self.joint_dim = 6
+        self.noise_dim = 4
+        self.total_input_dim = self.input_dim + self.joint_dim + self.noise_dim + 1  # z + prev_frame + noise + time
 
-        self.output_layer = nn.Sequential(
-            nn.LeakyReLU(0.1),
-            nn.Linear(32, 6),
-            nn.Sigmoid(),
+        self.fc_in = nn.Linear(self.total_input_dim, self.hidden_dim)
+        
+        self.gru = nn.GRU(
+            input_size=self.hidden_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=1,
+            batch_first=True
         )
-        nn.init.xavier_normal_(self.output_layer[1].weight)  # Xavier/Glorot initialization
-        nn.init.zeros_(self.output_layer[1].bias)  # Initialize bias to zeros
+        
+        self.joint_fc = nn.Sequential(
+            nn.Linear(self.hidden_dim, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, self.joint_dim),
+            nn.Sigmoid()
+        )
 
     def forward(self, video, deterministic=False):
         batch_size, seq_len, c, h, w = video.size()
@@ -321,18 +317,37 @@ class PoseVideoCNNRNN(nn.Module):
             std = torch.exp(0.5 * logvar)
             embedding += torch.rand_like(std) * std
 
-        # Repeat vector to 15x32
-        embedding = embedding.view(2, batch_size, 32)
-        decoder_input = torch.zeros(batch_size, seq_len, 32).to(device)
+        h = None  # hidden state for GRU
+        outputs = []
+        noise_std = 0.1 if not deterministic else 0.01
+        
+        # Initial previous frame: zeros (assume rest position)
+        prev_frame = torch.zeros(batch_size, self.joint_dim, device=device)
 
-        # Second RNN for time series modeling
-        rnn_out2, _ = self.temporal_rnn2(decoder_input, (embedding, embedding))  # Shape: [batch_size, 15, 64]
+        for t in range(seq_len):
+            # Generate small random noise per frame
+            noise = torch.randn(batch_size, self.noise_dim, device=device) * noise_std
 
-        # Output layer to get final 15x26 sequence
-        output = self.output_layer(rnn_out2)  # Shape: [batch_size, 15, 26]
-        # output = torch.clamp(output, 0, 1)  # Apply clamp to ensure outputs are between 0 and 1
+            # Normalized time step
+            time_step = torch.full((batch_size, 1), t / (seq_len - 1), device=device)
 
-        return output, mu, logvar
+            # Concatenate inputs
+            input_vec = torch.cat([embedding, prev_frame, noise, time_step], dim=-1).unsqueeze(1)  # (batch_size, 1, total_input_dim)
+
+            # Process through GRU
+            x = self.fc_in(input_vec)
+            out, h = self.gru(x, h)  # maintain hidden state h
+            frame = self.joint_fc(out.squeeze(1))  # (batch_size, joint_dim)
+
+            outputs.append(frame)
+
+            # Update previous frame
+            prev_frame = frame
+
+        # Stack outputs along time axis
+        outputs = torch.stack(outputs, dim=1)  # (batch_size, output_frames, joint_dim)
+
+        return outputs, mu, logvar
     
 class ForwardKinematics:
     def __init__(self, urdf_path):
@@ -580,24 +595,86 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     six_d = torch.cat([u, v_ortho], dim=-1)
     return six_d
 
-def loss_fn(fk, pose_data, model_output, lambda_R = 1.0, lambda_vel = 0.1, eps: float = 1e-7):
-    kine_output = fk.batch_forward_kinematics(model_output)  # [batch, 15, 48]
-    pose_loss = mse_loss(pose_data[:,:,0], kine_output[:,:,0])
-
-    velocity_in = torch.diff(pose_data[:,:,0], dim=1)
-    velocity_out = torch.diff(kine_output[:,:,0], dim=1)
-    vel_loss = mse_loss(velocity_in, velocity_out)
-
-    input_6d = batch_vectors_to_6D(pose_data, eps = eps)
-    output_6d = batch_vectors_to_6D(kine_output, eps = eps)
-    R_loss = torch.mean((output_6d - input_6d)**2)
-    # l1_loss = nn.L1Loss()
-    # R_loss = l1_loss(input_6d, output_6d)
-
+def frechet_distance(pred, target):
+    """
+    Compute the discrete Fréchet distance between two trajectories.
+    Args:
+        pred: (batch, seq_len, 3) - Predicted wrist positions.
+        target: (batch, seq_len, 3) - Ground truth wrist positions.
+    Returns:
+        (batch,) - Fréchet distance per sample.
+    """
+    batch_size, seq_len, _ = pred.shape
+    frechet_dist = torch.zeros(batch_size, device=pred.device)
     
-    loss = pose_loss + lambda_R * R_loss + lambda_vel * vel_loss
+    for i in range(batch_size):
+        # Compute pairwise Euclidean distance matrix
+        dist_matrix = torch.cdist(pred[i], target[i], p=2)  # (seq_len, seq_len)
+        
+        # Dynamic programming to compute Frechet distance
+        C = torch.zeros((seq_len, seq_len), device=pred.device)
+        C[0, 0] = dist_matrix[0, 0]
+        
+        for j in range(1, seq_len):
+            C[0, j] = torch.max(C[0, j-1], dist_matrix[0, j])
+        
+        for k in range(1, seq_len):
+            C[k, 0] = torch.max(C[k-1, 0], dist_matrix[k, 0])
+        
+        for k in range(1, seq_len):
+            for j in range(1, seq_len):
+                C[k, j] = torch.max(
+                    torch.min(
+                        torch.stack([C[k-1, j], C[k, j-1], C[k-1, j-1]])
+                    ),
+                    dist_matrix[k, j]
+                )
+        
+        frechet_dist[i] = C[-1, -1]
+    
+    return frechet_dist
 
-    return loss, pose_loss, R_loss, vel_loss
+def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, 
+          lambda_motion=2.0, lambda_rel_vel=1.5, lambda_traj=2.0, eps=1e-7):
+    """
+    Computes the loss between the predicted and actual pose data
+    
+    Args:
+        fk: Forward kinematics model
+        pose_data: Ground truth pose data [batch, 15, 3, 3]
+        model_output: Model predictions [batch, 15, 6]
+        logvar: Log variance from the model
+        mu: Mean from the model
+        lambda_R: Weight for rotation loss
+        lambda_kl: Weight for KL divergence loss
+        lambda_vel: Weight for velocity loss
+        lambda_motion: Weight for motion encouragement loss
+        lambda_rel_vel: Weight for relative velocity loss
+        lambda_traj: Weight for trajectory loss
+        eps: Small epsilon value to prevent division by zero
+        
+    Returns:
+        Tuple of total loss and individual loss components
+    """
+    kine_output = fk.batch_forward_kinematics(model_output)  # [batch, 15, 48]
+    
+    # Position loss - penalizes differences in hand position
+    pose_loss = frechet_distance(kine_output[:,:,0], pose_data[:,:,0]).mean()
+
+    # KL divergence loss for the VAE component
+    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+    # Rotation loss - penalizes differences in hand orientation
+    input_6d = batch_vectors_to_6D(pose_data, eps=eps)
+    output_6d = batch_vectors_to_6D(kine_output, eps=eps)
+    R_loss = torch.mean((output_6d - input_6d)**2)
+    
+    # Velocity loss - matches the velocity profiles
+    velocity_in = torch.diff(pose_data[:,:,0], dim=1)  # [batch, 14, 3]
+    velocity_out = torch.diff(kine_output[:,:,0], dim=1)  # [batch, 14, 3]
+    vel_loss = 30.0 * 15.0 * mse_loss(velocity_in, velocity_out)
+    
+    return pose_loss, R_loss, kl_loss, vel_loss
 
 def test_model(sample_path, urdf_path, model_path, output_path):
     """
@@ -620,11 +697,11 @@ def test_model(sample_path, urdf_path, model_path, output_path):
         f.write("------ "+sample+" ------\n")
         print("------ "+sample+" ------\n")
         for i in range(15):
-            loss, pose_loss, R_loss, vel_loss = loss_fn(fk, pose[:,i,2:].unsqueeze(0), model_output[:,i].unsqueeze(0))
-            f.write(f"- frame {i} Loss: {loss:.5f}, Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}\n")
+            pose_loss, R_loss, vel_loss = loss_fn(fk, pose[:,i,2:].unsqueeze(0), model_output[:,i].unsqueeze(0))
+            f.write(f"- frame {i} Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}\n")
         
-        loss, pose_loss, R_loss, vel_loss = loss_fn(fk, pose[:,:,2:], model_output)
-        f.write(f"\nTotal Loss: {loss:.5f}, Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}\n")
+        pose_loss, R_loss, vel_loss = loss_fn(fk, pose[:,:,2:], model_output)
+        f.write(f"\nTotal Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}\n")
 
         path = os.path.join(output_path,"fig",sample.split("/")[-1])
         if os.path.exists(path):
