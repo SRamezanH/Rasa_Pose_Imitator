@@ -634,8 +634,7 @@ def frechet_distance(pred, target):
     
     return frechet_dist
 
-def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, 
-          lambda_motion=2.0, lambda_rel_vel=1.5, lambda_traj=2.0, eps=1e-7):
+def loss_fn(fk, pose_data, model_output, eps=1e-7):
     """
     Computes the loss between the predicted and actual pose data
     
@@ -661,9 +660,6 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1
     # Position loss - penalizes differences in hand position
     pose_loss = frechet_distance(kine_output[:,:,0], pose_data[:,:,0]).mean()
 
-    # KL divergence loss for the VAE component
-    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
     # Rotation loss - penalizes differences in hand orientation
     input_6d = batch_vectors_to_6D(pose_data, eps=eps)
     output_6d = batch_vectors_to_6D(kine_output, eps=eps)
@@ -674,7 +670,7 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1
     velocity_out = torch.diff(kine_output[:,:,0], dim=1)  # [batch, 14, 3]
     vel_loss = 30.0 * 15.0 * mse_loss(velocity_in, velocity_out)
     
-    return pose_loss, R_loss, kl_loss, vel_loss
+    return pose_loss, R_loss, vel_loss
 
 def test_model(sample_path, urdf_path, model_path, output_path):
     """
