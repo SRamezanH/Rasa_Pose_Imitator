@@ -727,7 +727,7 @@ def main():
                 "/home/cedra/psl_project/5_dataset/IRIB2_48_13327_842-856_left",
                 "/home/cedra/psl_project/5_dataset/Deafinno_1036_36-50_left"]
 
-    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_4_best.pth"
+    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_1_best.pth"
 
     urdf_path="/home/cedra/psl_project/rasa/hand.urdf"
 
