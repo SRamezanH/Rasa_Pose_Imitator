@@ -705,7 +705,7 @@ def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0
     else:
         return final_value
 
-def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.01):
+def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.003):
     """
     Train the neural network model
 
@@ -823,7 +823,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             total=len(train_loader)
         )
 
-        lambda_kl = min(1.0, 0.02 * epoch)
+        lambda_kl = min(0.2, 0.005 * (epoch+1))
         lambda_R = lambda_scheduler(epoch, warmup_start=5, warmup_end=10, final_value=1.0)
         lambda_vel = lambda_scheduler(epoch, warmup_start=10, warmup_end=15, final_value=10)
 
