@@ -116,7 +116,7 @@ class ProtobufProcessor:
     def normalize_body_landmarks(landmarks, left_side):
         """Normalize body landmarks using shoulders as reference points"""
         if landmarks.shape[0] < 10:
-            return torch.zeros((1, 3)), torch.zeros((3, 3))  # Return zero if less than 2 landmarks
+            return torch.zeros((1, 3, 3))  # Return zero if less than 2 landmarks
         
         origin = landmarks[1]#.clone().detach()
         # Compute the distance between the shoulder and elbow as the scale factor
@@ -369,7 +369,7 @@ class PoseVideoCNNRNN(nn.Module):
         embedding = mu
         if not deterministic:
             std = torch.exp(0.5 * logvar)
-            embedding = mu + torch.rand_like(std) * std
+            embedding = mu + torch.randn_like(std) * std
 
         h = None  # hidden state for GRU
         outputs = []
@@ -825,7 +825,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
         lambda_kl = min(1.0, 0.02 * epoch)
         lambda_R = lambda_scheduler(epoch, warmup_start=5, warmup_end=10, final_value=1.0)
-        lambda_vel = lambda_scheduler(epoch, warmup_start=10, warmup_end=5, final_value=10)
+        lambda_vel = lambda_scheduler(epoch, warmup_start=10, warmup_end=15, final_value=10)
 
         for i, batch in enumerate(batch_pbar):
             video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
