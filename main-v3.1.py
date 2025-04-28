@@ -705,7 +705,7 @@ def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0
     else:
         return final_value
 
-def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.001):
+def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.01):
     """
     Train the neural network model
 
