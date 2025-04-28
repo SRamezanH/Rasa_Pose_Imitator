@@ -823,9 +823,9 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             total=len(train_loader)
         )
 
-        lambda_kl = min(1.0, 0.05 * epoch)
-        lambda_R = lambda_scheduler(epoch, warmup_start=3, warmup_end=6, final_value=1.0)
-        lambda_vel = lambda_scheduler(epoch, warmup_start=3, warmup_end=10, final_value=10.)
+        lambda_kl = min(1.0, 0.02 * epoch)
+        lambda_R = lambda_scheduler(epoch, warmup_start=5, warmup_end=10, final_value=1.0)
+        lambda_vel = lambda_scheduler(epoch, warmup_start=10, warmup_end=5, final_value=10)
 
         for i, batch in enumerate(batch_pbar):
             video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
@@ -835,7 +835,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             model_output, mu, logvar = model(video_data)  # Output: [batch, 15, 26] (predicted)
 
             # Compute loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl)
+            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
@@ -901,7 +901,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 model_output, mu, logvar = model(video_data)
 
                 # Compute loss
-                loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl)
+                loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
                 
                 loss_val = loss
                 pose_loss_val = pose_loss
