@@ -331,19 +331,19 @@ class PoseVideoCNNRNN(nn.Module):
         self.input_dim = 64
         self.joint_dim = 6
         self.noise_dim = 4
-        self.total_input_dim = self.input_dim + self.joint_dim + self.noise_dim + 1  # z + prev_frame + noise + time
+        self.total_input_dim = self.hidden_dim + self.noise_dim + 1  #+ self.joint_dim # z + prev_frame + noise + time
 
-        self.fc_in = nn.Linear(self.total_input_dim, self.hidden_dim)
+        self.fc_in = nn.Linear(self.input_dim, self.hidden_dim)
         
         self.gru = nn.GRU(
-            input_size=self.hidden_dim,
-            hidden_size=self.hidden_dim,
+            input_size=self.total_input_dim,
+            hidden_size=self.total_input_dim,
             num_layers=1,
             batch_first=True
         )
         
         self.joint_fc = nn.Sequential(
-            nn.Linear(self.hidden_dim, 64),
+            nn.Linear(self.total_input_dim, 64),
             nn.LeakyReLU(0.2),
             nn.Linear(64, self.joint_dim),
             nn.Sigmoid()
@@ -369,14 +369,16 @@ class PoseVideoCNNRNN(nn.Module):
         embedding = mu
         if not deterministic:
             std = torch.exp(0.5 * logvar)
-            embedding = mu + torch.randn_like(std) * std
+            embedding = embedding + torch.randn_like(std) * std
+
+        x = self.fc_in(embedding)
 
         h = None  # hidden state for GRU
         outputs = []
         noise_std = 0.1 if not deterministic else 0.01
         
         # Initial previous frame: zeros (assume rest position)
-        prev_frame = torch.zeros(batch_size, self.joint_dim, device=device)
+        # prev_frame = torch.zeros(batch_size, self.joint_dim, device=device)
 
         for t in range(seq_len):
             # Generate small random noise per frame
@@ -386,53 +388,22 @@ class PoseVideoCNNRNN(nn.Module):
             time_step = torch.full((batch_size, 1), t / (seq_len - 1), device=device)
 
             # Concatenate inputs
-            input_vec = torch.cat([embedding, prev_frame, noise, time_step], dim=-1).unsqueeze(1)  # (batch_size, 1, total_input_dim)
+            #input_vec = torch.cat([x, prev_frame, noise, time_step], dim=-1).unsqueeze(1)  # (batch_size, 1, total_input_dim)
+            input_vec = torch.cat([x, noise, time_step], dim=-1).unsqueeze(1)  # (batch_size, 1, total_input_dim)
 
             # Process through GRU
-            x = self.fc_in(input_vec)
-            out, h = self.gru(x, h)  # maintain hidden state h
+            out, h = self.gru(input_vec, h)  # maintain hidden state h
             frame = self.joint_fc(out.squeeze(1))  # (batch_size, joint_dim)
 
             outputs.append(frame)
 
             # Update previous frame
-            prev_frame = frame
+            # prev_frame = frame
 
         # Stack outputs along time axis
         outputs = torch.stack(outputs, dim=1)  # (batch_size, output_frames, joint_dim)
 
         return outputs, mu, logvar
-
-#     def batch_forward_kinematics(self, batch_joint_values):
-#         """
-#         Optimized batch forward kinematics
-#         Input: batch_joint_values - tensor [batch_size, seq_len, num_joints]
-#         Output: normalized positions tensor [batch_size, seq_len, 3, 3]
-#         """
-#         batch_size, seq_len, num_joints = batch_joint_values.shape
-        
-#         # Denormalize joint values in vectorized form
-#         joints = (batch_joint_values * self.joint_ranges) + self.joint_lowers
-        
-#         # Reshape for batch processing [batch*seq, num_joints]
-#         joints_flat = joints.view(-1, num_joints)
-        
-#         # Batch forward kinematics [batch*seq, 4, 4]
-#         fk_results = self.robot_chain.forward(joints_flat)
-        
-#         # Extract positions and reshape
-#         wrist_pos = fk_results[..., :3, 3].view(batch_size, seq_len, 3)
-#         finger1_pos = fk_results["right_Finger_1_1"][..., :3, 3].view(batch_size, seq_len, 3)
-#         finger4_pos = fk_results["right_Finger_4_1"][..., :3, 3].view(batch_size, seq_len, 3)
-        
-#         # Normalize positions using precomputed reference
-#         normalized_positions = torch.stack([
-#             (wrist_pos - fk_results["right_Shoulder_2"][..., :3, 3]) / self.L_ref,
-#             (finger1_pos - fk_results["right_Shoulder_2"][..., :3, 3]) / self.L_ref,
-#             (finger4_pos - fk_results["right_Shoulder_2"][..., :3, 3]) / self.L_ref,
-#         ], dim=2)
-        
-#         return normalized_positions
 
 class ForwardKinematics:
     def __init__(self, urdf_path):
@@ -823,7 +794,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             total=len(train_loader)
         )
 
-        lambda_kl = min(0.2, 0.005 * (epoch+1))
+        lambda_kl = 0.1#min(0.2, 0.005 * (epoch+1))
         lambda_R = lambda_scheduler(epoch, warmup_start=5, warmup_end=10, final_value=1.0)
         lambda_vel = lambda_scheduler(epoch, warmup_start=10, warmup_end=15, final_value=10)
 
