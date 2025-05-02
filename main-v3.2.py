@@ -288,7 +288,14 @@ class PoseVideoCNNRNN(nn.Module):
         
         # input projection layer to match the original CNN output dimensions
         # this replaces the CNN and projects pose input to the same dimension as before
-        self.pose_projection = nn.Linear(3*3, 256*4*4)  # 3x3 pose data to same dimension as CNN output
+        self.pose_projection = nn.Sequential(
+            nn.Linear(3*3, 64),
+            nn.LeakyReLU(0.1),
+            nn.Linear(64, 256),
+            nn.LeakyReLU(0.1),
+            nn.Linear(256, 256*4*4)
+            nn.LeakyReLU(0.1)
+        )  # 3x3 pose data to same dimension as CNN output
         
         # LSTM/GRU for temporal modeling
         self.temporal_rnn1 = nn.LSTM(
