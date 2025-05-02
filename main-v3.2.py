@@ -788,9 +788,9 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             total=len(train_loader)
         )
 
-        lambda_kl = 0.1#min(0.2, 0.005 * (epoch+1))
-        lambda_R = lambda_scheduler(epoch, warmup_start=5, warmup_end=10, final_value=1.0)
-        lambda_vel = lambda_scheduler(epoch, warmup_start=10, warmup_end=15, final_value=10)
+        lambda_kl = 0.1 * (1 - min(0.9, 0.005 * (epoch+1)))
+        lambda_R = lambda_scheduler(epoch, warmup_start=10, warmup_end=20, final_value=1.0)
+        lambda_vel = lambda_scheduler(epoch, warmup_start=20, warmup_end=30, final_value=10)
 
         for i, batch in enumerate(batch_pbar):
             # video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
