@@ -293,7 +293,7 @@ class PoseVideoCNNRNN(nn.Module):
             nn.LeakyReLU(0.1),
             nn.Linear(64, 256),
             nn.LeakyReLU(0.1),
-            nn.Linear(256, 256*4*4)
+            nn.Linear(256, 256*4*4),
             nn.LeakyReLU(0.1)
         )  # 3x3 pose data to same dimension as CNN output
         
