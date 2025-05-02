@@ -225,17 +225,17 @@ class PoseVideoDataset(Dataset):
             torch.Tensor: Tensor containing video frames with shape  [15, 3, 273, 210]
         """
         # Open the video file
-        video, _, _ = read_video(video_path ,output_format="TCHW")
-        video_tensor = video.to(device)
-        video_tensor = video_tensor[:15, :3, :210, :273]
-        num_frames, ch, h, w = video_tensor.shape
-        if num_frames < 15:
-            print("Low frame count" + video_path)
-            padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
-            video_tensor = torch.cat((video_tensor, padding), dim=0)
+        # video, _, _ = read_video(video_path ,output_format="TCHW")
+        # video_tensor = video.to(device)
+        # video_tensor = video_tensor[:15, :3, :210, :273]
+        # num_frames, ch, h, w = video_tensor.shape
+        # if num_frames < 15:
+        #     print("Low frame count" + video_path)
+        #     padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
+        #     video_tensor = torch.cat((video_tensor, padding), dim=0)
 
         #return video_tensor.permute(0,1,3,2) / 255.0
-        return video_tensor / 255.0
+        return torch.zeros([15, 3, 273, 210])# video_tensor / 255.0
 
     def _load_protobuf(self, pb_path):
         """
@@ -289,11 +289,7 @@ class PoseVideoCNNRNN(nn.Module):
         # input projection layer to match the original CNN output dimensions
         # this replaces the CNN and projects pose input to the same dimension as before
         self.pose_projection = nn.Sequential(
-            nn.Linear(3*3, 64),
-            nn.LeakyReLU(0.1),
-            nn.Linear(64, 256),
-            nn.LeakyReLU(0.1),
-            nn.Linear(256, 256*4*4),
+            nn.Linear(3*3, 256*4*4),
             nn.LeakyReLU(0.1)
         )  # 3x3 pose data to same dimension as CNN output
         
@@ -673,7 +669,7 @@ def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0
     else:
         return final_value
 
-def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.003):
+def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.01):
     """
     Train the neural network model
 
@@ -707,8 +703,8 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
     print(f"Dataset loaded: {len(dataset)} valid samples")
 
     # Split dataset into train and test sets
-    train_size = int(0.4 * len(dataset))
-    eval_size = int(0.1 * len(dataset))
+    train_size = int(0.8 * len(dataset))
+    eval_size = int(0.2 * len(dataset))
     test_size = 0 # int(0.15 * len(dataset))
     e = len(dataset) - train_size - eval_size - test_size
     train_dataset, eval_dataset, test_dataset, _ = random_split(dataset, [train_size, eval_size, test_size, e])
