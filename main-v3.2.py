@@ -279,59 +279,55 @@ class PoseVideoDataset(Dataset):
 
 
 # Neural Network Model Definition
+
 class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
-        # CNN for spatial feature extraction
-        # self.video_cnn = nn.Sequential(...)
-        
-        # input projection layer to match the original CNN output dimensions
-        # this replaces the CNN and projects pose input to the same dimension as before
+        # Projection layer to simulate CNN output from pose input
         self.pose_projection = nn.Sequential(
-            nn.Linear(3*3, 256*4*4),
+            nn.Linear(3 * 3, 256 * 4 * 4),
             nn.LeakyReLU(0.1)
-        )  # 3x3 pose data to same dimension as CNN output
-        
-        # LSTM/GRU for temporal modeling
+        )  # Input: (3,3) -> Flattened to 9 -> Projected
+
+        # Temporal RNN (LSTM)
         self.temporal_rnn1 = nn.LSTM(
-                input_size=256*4*4,
-                hidden_size=128,
-                num_layers=1,
-                batch_first=True,
-                bidirectional=False,
-            )
-        
-        
-        # Latent space projection
+            input_size=256 * 4 * 4,
+            hidden_size=128,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=False
+        )
+
+        # Latent space
         self.fc_mu = nn.Sequential(
             nn.Dropout(0.1),
             nn.Linear(128, 64),
             nn.LeakyReLU(0.1),
         )
-        
+
         self.fc_logvar = nn.Sequential(
             nn.Dropout(0.1),
             nn.Linear(128, 64),
             nn.LeakyReLU(0.1),
         )
-        
-        # Decoder
+
+        # Decoder parameters
         self.hidden_dim = 256
         self.input_dim = 64
-        self.joint_dim = 6
+        self.joint_dim = 9  # Updated to produce 3x3 output
         self.noise_dim = 4
-        self.total_input_dim = self.hidden_dim + self.noise_dim + 1  #+ self.joint_dim # z + prev_frame + noise + time
+        self.total_input_dim = self.hidden_dim + self.noise_dim + 1  # latent + noise + time
 
         self.fc_in = nn.Linear(self.input_dim, self.hidden_dim)
-        
+
         self.gru = nn.GRU(
             input_size=self.total_input_dim,
             hidden_size=self.total_input_dim,
             num_layers=1,
             batch_first=True
         )
-        
+
         self.joint_fc = nn.Sequential(
             nn.Linear(self.total_input_dim, 64),
             nn.LeakyReLU(0.2),
@@ -340,25 +336,23 @@ class PoseVideoCNNRNN(nn.Module):
         )
 
     def forward(self, input_data, deterministic=False):
-        # Changed to accept pose data directly instead of video
         batch_size, seq_len = input_data.shape[0], input_data.shape[1]
-        
-        # Flatten the pose data from [batch_size, seq_len, 3, 3] to [batch_size, seq_len, 9]
-        pose_flattened = input_data.reshape(batch_size, seq_len, -1)
-        
-        # Project pose data to match the dimension that CNN would have produced
+
+        # Flatten pose input: (B, T, 3, 3) -> (B, T, 9)
+        pose_flattened = input_data.view(batch_size, seq_len, -1)
+
+        # Project pose input
         projected_pose = self.pose_projection(pose_flattened)
 
-        # First RNN (LSTM/GRU) for temporal modeling
-        #_, (rnn_out, _) = self.temporal_rnn1(video)
+        # RNN for temporal modeling
         _, (rnn_out, _) = self.temporal_rnn1(projected_pose)
         rnn_out = rnn_out.squeeze(0)
-        
+
         # Latent space
         mu = self.fc_mu(rnn_out)
         logvar = torch.clamp(self.fc_logvar(rnn_out), min=-10, max=10)
 
-        # reparameterization
+        # Reparameterization trick
         embedding = mu
         if not deterministic:
             std = torch.exp(0.5 * logvar)
@@ -366,37 +360,26 @@ class PoseVideoCNNRNN(nn.Module):
 
         x = self.fc_in(embedding)
 
-        h = None  # hidden state for GRU
+        h = None
         outputs = []
         noise_std = 0.1 if not deterministic else 0.01
-        
-        # Initial previous frame: zeros (assume rest position)
-        # prev_frame = torch.zeros(batch_size, self.joint_dim, device=device)
 
         for t in range(seq_len):
-            # Generate small random noise per frame
-            noise = torch.randn(batch_size, self.noise_dim, device=device) * noise_std
+            noise = torch.randn(batch_size, self.noise_dim, device=input_data.device) * noise_std
+            time_step = torch.full((batch_size, 1), t / (seq_len - 1), device=input_data.device)
 
-            # Normalized time step
-            time_step = torch.full((batch_size, 1), t / (seq_len - 1), device=device)
-
-            # Concatenate inputs
-            #input_vec = torch.cat([x, prev_frame, noise, time_step], dim=-1).unsqueeze(1)  # (batch_size, 1, total_input_dim)
-            input_vec = torch.cat([x, noise, time_step], dim=-1).unsqueeze(1)  # (batch_size, 1, total_input_dim)
-
-            # Process through GRU
-            out, h = self.gru(input_vec, h)  # maintain hidden state h
-            frame = self.joint_fc(out.squeeze(1))  # (batch_size, joint_dim)
+            input_vec = torch.cat([x, noise, time_step], dim=-1).unsqueeze(1)  # (B, 1, D)
+            out, h = self.gru(input_vec, h)
+            frame = self.joint_fc(out.squeeze(1))  # (B, 9)
 
             outputs.append(frame)
 
-            # Update previous frame
-            # prev_frame = frame
-
-        # Stack outputs along time axis
-        outputs = torch.stack(outputs, dim=1)  # (batch_size, output_frames, joint_dim)
+        # Stack and reshape to (B, T, 3, 3)
+        outputs = torch.stack(outputs, dim=1)  # (B, T, 9)
+        outputs = outputs.view(batch_size, seq_len, 3, 3)
 
         return outputs, mu, logvar
+
 
 class ForwardKinematics:
     def __init__(self, urdf_path):
@@ -615,15 +598,19 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     # Stack u and v_ortho to form 6D representation
     six_d = torch.cat([u, v_ortho], dim=-1)
     return six_d
+ #import torch
+import torch.nn.functional as F
+from torch.nn import MSELoss
 
-def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
+mse_loss = MSELoss()
+
+def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
     """
-    Computes the loss between the predicted and actual pose data
+    Computes the loss between the predicted and actual pose data (no FK needed)
     
     Args:
-        fk: Forward kinematics model
         pose_data: Ground truth pose data [batch, 15, 3, 3]
-        model_output: Model predictions [batch, 15, 6]
+        model_output: Model predictions [batch, 15, 3, 3] => directly output from network
         logvar: Log variance from the model
         mu: Mean from the model
         lambda_R: Weight for rotation loss
@@ -634,26 +621,25 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1
     Returns:
         Tuple of total loss and individual loss components
     """
-    kine_output = fk.batch_forward_kinematics(model_output)  # [batch, 15, 48]
-    
-    # Position loss - penalizes differences in hand position
-    pose_loss = mse_loss(kine_output[:,:,0], pose_data[:,:,0])
+    # Position loss (e.g., difference in palm position)
+    #  may select specific joints or axes; here we use the 1st vector of rotation matrix
+    pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
 
-    # KL divergence loss for the VAE component
+    # KL divergence loss for VAE regularization
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
-    # Rotation loss - penalizes differences in hand orientation
+    # Rotation loss in 6D representation
     input_6d = batch_vectors_to_6D(pose_data, eps=eps)
-    output_6d = batch_vectors_to_6D(kine_output, eps=eps)
-    R_loss = torch.mean((output_6d - input_6d)**2)
-    
-    # Velocity loss - matches the velocity profiles
-    velocity_in = torch.diff(pose_data[:,:,0], dim=1)  # [batch, 14, 3]
-    velocity_out = torch.diff(kine_output[:,:,0], dim=1)  # [batch, 14, 3]
+    output_6d = batch_vectors_to_6D(model_output, eps=eps)
+    R_loss = torch.mean((output_6d - input_6d) ** 2)
+
+    # Velocity loss based on movement of first vector of rotation matrix (e.g., palm position)
+    velocity_in = torch.diff(pose_data[:, :, 0], dim=1)  # [batch, 14, 3]
+    velocity_out = torch.diff(model_output[:, :, 0], dim=1)  # [batch, 14, 3]
     dir_loss = 1.0 - F.cosine_similarity(velocity_in, velocity_out, dim=-1).mean()
     vel_loss = 30.0 * mse_loss(velocity_in, velocity_out)
-    
-    # Combine all loss terms with their respective weights
+
+    # Combine all loss terms
     loss = pose_loss + lambda_R * R_loss + lambda_kl * kl_loss + lambda_vel * (vel_loss + dir_loss)
 
     return loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss
@@ -669,7 +655,7 @@ def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0
     else:
         return final_value
 
-def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.01):
+def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0.01):
     """
     Train the neural network model
 
@@ -753,7 +739,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
 
     # Initialize forward kinematics
-    fk = ForwardKinematics(urdf_path)
+    #fk = ForwardKinematics(urdf_path)
     
     # Import tqdm for progress bars
     from tqdm import tqdm
@@ -801,7 +787,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             model_output, mu, logvar = model(pose_data)  # Output: [batch, 15, 6] (predicted)
 
             # Compute loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
@@ -867,7 +853,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 model_output, mu, logvar = model(pose_data)
 
                 # Compute loss
-                loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+                loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
                 
                 loss_val = loss
                 pose_loss_val = pose_loss
@@ -957,7 +943,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             model_output, mu, logvar = model(pose_data)
             
             # Compute Loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
 
             test_loss += loss
             test_pose_loss += pose_loss
@@ -1052,7 +1038,7 @@ def main():
         train_model(
             data_dir=data_dir,
             test_dir=test_dir,
-            urdf_path=urdf_path,
+            
             num_epochs=num_epochs,
             batch_size=batch_size,
         )
