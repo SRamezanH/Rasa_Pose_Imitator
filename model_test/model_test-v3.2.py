@@ -110,7 +110,7 @@ class ProtobufProcessor:
     def normalize_body_landmarks(landmarks, left_side):
         """Normalize body landmarks using shoulders as reference points"""
         if landmarks.shape[0] < 10:
-            return torch.zeros((1, 3)), torch.zeros((3, 3))  # Return zero if less than 2 landmarks
+            return torch.zeros((1, 3, 3))  # Return zero if less than 2 landmarks
         
         origin = landmarks[1].clone().detach()
         # Compute the distance between the shoulder and elbow as the scale factor
@@ -199,73 +199,48 @@ class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
-        # Projection layer to simulate CNN output from pose input
-        self.pose_projection = nn.Sequential(
-            nn.Linear(3 * 3, 256 * 4 * 4),
-            nn.LeakyReLU(0.1)
-        )  # Input: (3,3) -> Flattened to 9 -> Projected
-
         # Temporal RNN (LSTM)
-        self.temporal_rnn1 = nn.LSTM(
-            input_size=256 * 4 * 4,
-            hidden_size=128,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=False
+        self.encoder = nn.Sequential(
+            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # (8, 15, 3, 3)
+            nn.ReLU(),
+            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1), # (16, 8, 2, 2)
+            nn.ReLU(),
+            nn.Flatten()
         )
 
         # Latent space
         self.fc_mu = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(128, 64),
+            nn.Linear(16*8*2*2, 16),
             nn.LeakyReLU(0.1),
         )
 
         self.fc_logvar = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(128, 64),
+            nn.Linear(16*8*2*2, 16),
             nn.LeakyReLU(0.1),
         )
 
         # Decoder parameters
-        self.hidden_dim = 256
-        self.input_dim = 64
-        self.joint_dim = 9  # Updated to produce 3x3 output
-        self.noise_dim = 4
-        self.total_input_dim = self.hidden_dim + self.noise_dim + 1  # latent + noise + time
+        self.fc_decode = nn.Linear(16, 16 * 8 * 2 * 2)
 
-        self.fc_in = nn.Linear(self.input_dim, self.hidden_dim)
-
-        self.gru = nn.GRU(
-            input_size=self.total_input_dim,
-            hidden_size=self.total_input_dim,
-            num_layers=1,
-            batch_first=True
-        )
-
-        self.joint_fc = nn.Sequential(
-            nn.Linear(self.total_input_dim, 64),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, self.joint_dim),
-            nn.Sigmoid()
+        self.decoder = nn.Sequential(
+            nn.Unflatten(1, (16, 8, 2, 2)),
+            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1),# output_padding=(1,1,1)),
+            nn.ReLU(),
+            nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
         )
 
     def forward(self, input_data, deterministic=False):
         batch_size, seq_len = input_data.shape[0], input_data.shape[1]
 
         # Flatten pose input: (B, T, 3, 3) -> (B, T, 9)
-        pose_flattened = input_data.view(batch_size, seq_len, -1)
-
-        # Project pose input
-        projected_pose = self.pose_projection(pose_flattened)
-
-        # RNN for temporal modeling
-        _, (rnn_out, _) = self.temporal_rnn1(projected_pose)
-        rnn_out = rnn_out.squeeze(0)
+        x = input_data.permute(0, 3, 1, 2).unsqueeze(1)
+        h = self.encoder(x)
 
         # Latent space
-        mu = self.fc_mu(rnn_out)
-        logvar = torch.clamp(self.fc_logvar(rnn_out), min=-10, max=10)
+        mu = self.fc_mu(h)
+        logvar = torch.clamp(self.fc_logvar(h), min=-10, max=10)
 
         # Reparameterization trick
         embedding = mu
@@ -273,27 +248,11 @@ class PoseVideoCNNRNN(nn.Module):
             std = torch.exp(0.5 * logvar)
             embedding = embedding + torch.randn_like(std) * std
 
-        x = self.fc_in(embedding)
+        h = self.fc_decode(embedding)
+        output = self.decoder(h)
+        output = output.squeeze(1)
 
-        h = None
-        outputs = []
-        noise_std = 0.1 if not deterministic else 0.01
-
-        for t in range(seq_len):
-            noise = torch.randn(batch_size, self.noise_dim, device=input_data.device) * noise_std
-            time_step = torch.full((batch_size, 1), t / (seq_len - 1), device=input_data.device)
-
-            input_vec = torch.cat([x, noise, time_step], dim=-1).unsqueeze(1)  # (B, 1, D)
-            out, h = self.gru(input_vec, h)
-            frame = self.joint_fc(out.squeeze(1))  # (B, 9)
-
-            outputs.append(frame)
-
-        # Stack and reshape to (B, T, 3, 3)
-        outputs = torch.stack(outputs, dim=1)  # (B, T, 9)
-        outputs = outputs.view(batch_size, seq_len, 3, 3)
-
-        return outputs, mu, logvar
+        return output, mu, logvar
     
 def visualize(model_output, pose, title, path):
     fig = plt.figure(figsize=(10,8))
@@ -338,17 +297,17 @@ def visualize(model_output, pose, title, path):
     z = [dz + pose[3,2], dz + pose[4,2]]
     ax.plot(x, y, z, 'r-', linewidth=2)
 
-    x = [dx + model_output[0,0], dx + model_output[1,0]+ model_output[0,0]]
-    y = [dy + model_output[0,1], dy + model_output[1,1]+ model_output[0,1]]
-    z = [dz + model_output[0,2], dz + model_output[1,2]+ model_output[0,2]]
+    x = [dx + model_output[0,0], dx + model_output[1,0]]
+    y = [dy + model_output[0,1], dy + model_output[1,1]]
+    z = [dz + model_output[0,2], dz + model_output[1,2]]
     ax.plot(x, y, z, 'b-', linewidth=2)
-    x = [dx + model_output[0,0], dx + model_output[2,0] + model_output[0,0]]
-    y = [dy + model_output[0,1], dy + model_output[2,1] + model_output[0,1]]
-    z = [dz + model_output[0,2], dz + model_output[2,2] + model_output[0,2]]
+    x = [dx + model_output[0,0], dx + model_output[2,0]]
+    y = [dy + model_output[0,1], dy + model_output[2,1]]
+    z = [dz + model_output[0,2], dz + model_output[2,2]]
     ax.plot(x, y, z, 'b-', linewidth=2)
-    x = [dx + model_output[1,0] + model_output[0,0], dx + model_output[2,0] + model_output[0,0]]
-    y = [dy + model_output[1,1] + model_output[0,1], dy + model_output[2,1] + model_output[0,1]]
-    z = [dz + model_output[1,2] + model_output[0,2], dz + model_output[2,2] + model_output[0,2]]
+    x = [dx + model_output[1,0], dx + model_output[2,0]]
+    y = [dy + model_output[1,1], dy + model_output[2,1]]
+    z = [dz + model_output[1,2], dz + model_output[2,2]]
     ax.plot(x, y, z, 'b-', linewidth=2)
     
     # Set plot limits
@@ -425,23 +384,28 @@ def loss_fn(pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, si
     """
     # Position loss (e.g., difference in palm position)
     #  may select specific joints or axes; here we use the 1st vector of rotation matrix
-    pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
+    # pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
+    # pose_loss = mse_loss(model_output, pose_data)
+    errors = torch.abs(model_output - pose_data)
+    max_per_joint, _ = torch.max(
+            errors.view(errors.size(0), errors.size(1), errors.size(2), -1),
+            dim=1  # Reduce across frames and coordinates
+        )
+    pose_loss = torch.mean(max_per_joint)
 
     # Rotation loss in 6D representation
-    input_6d = batch_vectors_to_6D(pose_data, eps=eps)
-    output_6d = batch_vectors_to_6D(model_output, eps=eps)
-    R_loss = torch.mean((output_6d - input_6d) ** 2)
+    # input_6d = batch_vectors_to_6D(pose_data, eps=eps)
+    # output_6d = batch_vectors_to_6D(model_output, eps=eps)
+    # R_loss = torch.mean((output_6d - input_6d) ** 2)
 
-    vel_loss = 0.0
-    dir_loss = 0.0
-    if(not single):
-        # Velocity loss based on movement of first vector of rotation matrix (e.g., palm position)
-        velocity_in = torch.diff(pose_data[:, :, 0], dim=1)  # [batch, 14, 3]
-        velocity_out = torch.diff(model_output[:, :, 0], dim=1)  # [batch, 14, 3]
-        dir_loss = 1.0 - F.cosine_similarity(velocity_in, velocity_out, dim=-1).mean()
-        vel_loss = 30.0 * mse_loss(velocity_in, velocity_out)
+    # Velocity loss based on movement of first vector of rotation matrix (e.g., palm position)
+    # velocity_in = torch.diff(pose_data, dim=1)  # [batch, 14, 3]
+    # velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 3]
+    # dir_loss = 1.0 - F.cosine_similarity(velocity_in, velocity_out, dim=-1).mean()
+    # vel_loss = 30.0 * mse_loss(velocity_in, velocity_out)
 
-    return pose_loss, R_loss, vel_loss, dir_loss
+    return pose_loss, 0, 0, 0#loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss
+
 
 def test_model(sample_path, urdf_path, model_path, output_path):
     """
@@ -461,11 +425,12 @@ def test_model(sample_path, urdf_path, model_path, output_path):
         f.write("------ "+sample+" ------\n")
         print("------ "+sample+" ------\n")
         for i in range(15):
-            pose_loss, R_loss, _, _ = loss_fn(model_output[:,i], pose[:,i,2:].unsqueeze(0), model_output[:,i].unsqueeze(0), single=True)
+            pose_loss, R_loss, _, _ = loss_fn(pose[:,i,2:].unsqueeze(0), model_output[:,i].unsqueeze(0), single=True)
             f.write(f"- frame {i} Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}\n")
         
-        pose_loss, R_loss, vel_loss, dir_loss = loss_fn(model_output, pose[:,:,2:], model_output)
+        pose_loss, R_loss, vel_loss, dir_loss = loss_fn(pose[:,:,2:], model_output)
         f.write(f"\nTotal Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}, Dir Loss: {dir_loss:.5f}\n")
+        print(f"\nTotal Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}, Dir Loss: {dir_loss:.5f}\n")
 
         path = os.path.join(output_path,"fig",sample.split("/")[-1])
         if os.path.exists(path):
@@ -491,7 +456,7 @@ def main():
                 "/home/cedra/psl_project/5_dataset/IRIB2_48_13327_842-856_left",
                 "/home/cedra/psl_project/5_dataset/Deafinno_1036_36-50_left"]
 
-    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_6_best.pth"
+    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_98_best.pth"
 
     urdf_path="/home/cedra/psl_project/rasa/hand.urdf"
 

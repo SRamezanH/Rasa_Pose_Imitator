@@ -284,73 +284,48 @@ class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
-        # Projection layer to simulate CNN output from pose input
-        self.pose_projection = nn.Sequential(
-            nn.Linear(3 * 3, 256 * 4 * 4),
-            nn.LeakyReLU(0.1)
-        )  # Input: (3,3) -> Flattened to 9 -> Projected
-
         # Temporal RNN (LSTM)
-        self.temporal_rnn1 = nn.LSTM(
-            input_size=256 * 4 * 4,
-            hidden_size=128,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=False
+        self.encoder = nn.Sequential(
+            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # (8, 15, 3, 3)
+            nn.ReLU(),
+            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1), # (16, 8, 2, 2)
+            nn.ReLU(),
+            nn.Flatten()
         )
 
         # Latent space
         self.fc_mu = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(128, 64),
+            nn.Linear(16*8*2*2, 16),
             nn.LeakyReLU(0.1),
         )
 
         self.fc_logvar = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(128, 64),
+            nn.Linear(16*8*2*2, 16),
             nn.LeakyReLU(0.1),
         )
 
         # Decoder parameters
-        self.hidden_dim = 256
-        self.input_dim = 64
-        self.joint_dim = 9  # Updated to produce 3x3 output
-        self.noise_dim = 4
-        self.total_input_dim = self.hidden_dim + self.noise_dim + 1  # latent + noise + time
+        self.fc_decode = nn.Linear(16, 16 * 8 * 2 * 2)
 
-        self.fc_in = nn.Linear(self.input_dim, self.hidden_dim)
-
-        self.gru = nn.GRU(
-            input_size=self.total_input_dim,
-            hidden_size=self.total_input_dim,
-            num_layers=1,
-            batch_first=True
-        )
-
-        self.joint_fc = nn.Sequential(
-            nn.Linear(self.total_input_dim, 64),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, self.joint_dim),
-            nn.Sigmoid()
+        self.decoder = nn.Sequential(
+            nn.Unflatten(1, (16, 8, 2, 2)),
+            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1),# output_padding=(1,1,1)),
+            nn.ReLU(),
+            nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
         )
 
     def forward(self, input_data, deterministic=False):
         batch_size, seq_len = input_data.shape[0], input_data.shape[1]
 
         # Flatten pose input: (B, T, 3, 3) -> (B, T, 9)
-        pose_flattened = input_data.view(batch_size, seq_len, -1)
-
-        # Project pose input
-        projected_pose = self.pose_projection(pose_flattened)
-
-        # RNN for temporal modeling
-        _, (rnn_out, _) = self.temporal_rnn1(projected_pose)
-        rnn_out = rnn_out.squeeze(0)
+        x = input_data.permute(0, 3, 1, 2).unsqueeze(1)
+        h = self.encoder(x)
 
         # Latent space
-        mu = self.fc_mu(rnn_out)
-        logvar = torch.clamp(self.fc_logvar(rnn_out), min=-10, max=10)
+        mu = self.fc_mu(h)
+        logvar = torch.clamp(self.fc_logvar(h), min=-10, max=10)
 
         # Reparameterization trick
         embedding = mu
@@ -358,27 +333,11 @@ class PoseVideoCNNRNN(nn.Module):
             std = torch.exp(0.5 * logvar)
             embedding = embedding + torch.randn_like(std) * std
 
-        x = self.fc_in(embedding)
+        h = self.fc_decode(embedding)
+        output = self.decoder(h)
+        output = output.squeeze(1)
 
-        h = None
-        outputs = []
-        noise_std = 0.1 if not deterministic else 0.01
-
-        for t in range(seq_len):
-            noise = torch.randn(batch_size, self.noise_dim, device=input_data.device) * noise_std
-            time_step = torch.full((batch_size, 1), t / (seq_len - 1), device=input_data.device)
-
-            input_vec = torch.cat([x, noise, time_step], dim=-1).unsqueeze(1)  # (B, 1, D)
-            out, h = self.gru(input_vec, h)
-            frame = self.joint_fc(out.squeeze(1))  # (B, 9)
-
-            outputs.append(frame)
-
-        # Stack and reshape to (B, T, 3, 3)
-        outputs = torch.stack(outputs, dim=1)  # (B, T, 9)
-        outputs = outputs.view(batch_size, seq_len, 3, 3)
-
-        return outputs, mu, logvar
+        return output, mu, logvar
 
 
 class ForwardKinematics:
@@ -623,26 +582,33 @@ def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, la
     """
     # Position loss (e.g., difference in palm position)
     #  may select specific joints or axes; here we use the 1st vector of rotation matrix
-    pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
+    # pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
+    # pose_loss = mse_loss(model_output, pose_data)
+    errors = torch.abs(model_output - pose_data)
+    max_per_joint, _ = torch.max(
+            errors.view(errors.size(0), errors.size(1), errors.size(2), -1),
+            dim=1  # Reduce across frames and coordinates
+        )
+    pose_loss = torch.mean(max_per_joint)
 
     # KL divergence loss for VAE regularization
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
     # Rotation loss in 6D representation
-    input_6d = batch_vectors_to_6D(pose_data, eps=eps)
-    output_6d = batch_vectors_to_6D(model_output, eps=eps)
-    R_loss = torch.mean((output_6d - input_6d) ** 2)
+    # input_6d = batch_vectors_to_6D(pose_data, eps=eps)
+    # output_6d = batch_vectors_to_6D(model_output, eps=eps)
+    # R_loss = torch.mean((output_6d - input_6d) ** 2)
 
     # Velocity loss based on movement of first vector of rotation matrix (e.g., palm position)
-    velocity_in = torch.diff(pose_data[:, :, 0], dim=1)  # [batch, 14, 3]
-    velocity_out = torch.diff(model_output[:, :, 0], dim=1)  # [batch, 14, 3]
-    dir_loss = 1.0 - F.cosine_similarity(velocity_in, velocity_out, dim=-1).mean()
-    vel_loss = 30.0 * mse_loss(velocity_in, velocity_out)
+    # velocity_in = torch.diff(pose_data, dim=1)  # [batch, 14, 3]
+    # velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 3]
+    # dir_loss = 1.0 - F.cosine_similarity(velocity_in, velocity_out, dim=-1).mean()
+    # vel_loss = 30.0 * mse_loss(velocity_in, velocity_out)
 
     # Combine all loss terms
-    loss = pose_loss + lambda_R * R_loss + lambda_kl * kl_loss + lambda_vel * (vel_loss + dir_loss)
+    loss = pose_loss + lambda_kl * kl_loss #+ lambda_R * R_loss + lambda_vel * (vel_loss + 0.5*dir_loss)
 
-    return loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss
+    return loss, pose_loss, 0, kl_loss, 0, 0#loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss
 
 def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0.5):
     """Linear warmup for velocity loss coefficient"""
@@ -655,7 +621,7 @@ def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0
     else:
         return final_value
 
-def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0.01):
+def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0.001):
     """
     Train the neural network model
 
@@ -776,7 +742,7 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
 
         lambda_kl = 0.1 * (1 - min(0.9, 0.005 * (epoch+1)))
         lambda_R = lambda_scheduler(epoch, warmup_start=10, warmup_end=20, final_value=1.0)
-        lambda_vel = lambda_scheduler(epoch, warmup_start=20, warmup_end=30, final_value=10)
+        lambda_vel = lambda_scheduler(epoch, warmup_start=5, warmup_end=45, final_value=30)
 
         for i, batch in enumerate(batch_pbar):
             # video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
@@ -787,7 +753,7 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
             model_output, mu, logvar = model(pose_data)  # Output: [batch, 15, 6] (predicted)
 
             # Compute loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
@@ -797,10 +763,10 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
             # Update running loss
             loss_val = loss.item()
             pose_loss_val = pose_loss.item()
-            R_loss_val = R_loss.item()
+            R_loss_val = 0#R_loss.item()
             kl_loss_val = kl_loss.item()
-            vel_loss_val = vel_loss.item()
-            dir_loss_val = dir_loss.item()
+            vel_loss_val = 0#vel_loss.item()
+            dir_loss_val = 0#dir_loss.item()
             
             total_loss += loss_val
             total_pose_loss += pose_loss_val
@@ -917,50 +883,50 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
         
     print(f"\nTraining completed in {num_epochs} epochs")
 
-    # Evaluation on test data
-    print("\nEvaluating model on test data...")
-    model.eval()  # Set model to evaluation mode
-    test_loss = 0
-    test_pose_loss = 0
-    test_R_loss = 0
-    test_kl_loss = 0
-    test_vel_loss = 0
-    test_dir_loss = 0
+    # # Evaluation on test data
+    # print("\nEvaluating model on test data...")
+    # model.eval()  # Set model to evaluation mode
+    # test_loss = 0
+    # test_pose_loss = 0
+    # test_R_loss = 0
+    # test_kl_loss = 0
+    # test_vel_loss = 0
+    # test_dir_loss = 0
     
-    # Progress bar for test batches
-    test_pbar = tqdm(
-        test_loader, 
-        desc="Testing", 
-        total=len(test_loader)
-    )
+    # # Progress bar for test batches
+    # test_pbar = tqdm(
+    #     test_loader, 
+    #     desc="Testing", 
+    #     total=len(test_loader)
+    # )
 
-    with torch.no_grad():  # No gradient computation
-        for i, batch in enumerate(test_pbar):
-            # video_data = batch["video"]
-            pose_data = batch["pose"]
+    # with torch.no_grad():  # No gradient computation
+    #     for i, batch in enumerate(test_pbar):
+    #         # video_data = batch["video"]
+    #         pose_data = batch["pose"]
 
-            # Forward pass with pose data as input instead of video
-            model_output, mu, logvar = model(pose_data)
+    #         # Forward pass with pose data as input instead of video
+    #         model_output, mu, logvar = model(pose_data)
             
-            # Compute Loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+    #         # Compute Loss
+    #         loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
 
-            test_loss += loss
-            test_pose_loss += pose_loss
-            test_R_loss += R_loss
-            test_kl_loss += kl_loss
-            test_vel_loss += vel_loss
-            test_dir_loss += dir_loss
+    #         test_loss += loss
+    #         test_pose_loss += pose_loss
+    #         test_R_loss += R_loss
+    #         test_kl_loss += kl_loss
+    #         test_vel_loss += vel_loss
+    #         test_dir_loss += dir_loss
 
-    test_loss /= len(test_loader)
-    test_pose_loss /= len(test_loader)
-    test_R_loss /= len(test_loader)
-    test_kl_loss /= len(test_loader)
-    test_vel_loss /= len(test_loader)
-    test_dir_loss /= len(test_loader)
+    # test_loss /= len(test_loader)
+    # test_pose_loss /= len(test_loader)
+    # test_R_loss /= len(test_loader)
+    # test_kl_loss /= len(test_loader)
+    # test_vel_loss /= len(test_loader)
+    # test_dir_loss /= len(test_loader)
 
-    print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, R Loss: {test_R_loss:.5f}, "
-          f"KL Loss: {test_kl_loss:.5f}, Vel Loss: {test_vel_loss:.5f}, dir Loss: {test_dir_loss:.5f}")
+    # print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, R Loss: {test_R_loss:.5f}, "
+    #       f"KL Loss: {test_kl_loss:.5f}, Vel Loss: {test_vel_loss:.5f}, dir Loss: {test_dir_loss:.5f}")
 
 def main():
     """Main function to parse arguments and run the training or testing process"""
