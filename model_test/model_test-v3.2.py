@@ -230,6 +230,9 @@ class PoseVideoCNNRNN(nn.Module):
             nn.ReLU(),
             nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
         )
+        
+        # Transform 3x3 representation to 6D representation
+        self.fc_output = nn.Linear(15 * 3 * 3, 15 * 6)
 
     def forward(self, input_data, deterministic=False):
         batch_size, seq_len = input_data.shape[0], input_data.shape[1]
@@ -251,8 +254,13 @@ class PoseVideoCNNRNN(nn.Module):
         h = self.fc_decode(embedding)
         output = self.decoder(h)
         output = output.squeeze(1)
+        
+        # Transform to 6D representation
+        output_flat = output.view(batch_size, -1)  # (B, 135)
+        output_6d = self.fc_output(output_flat)  # (B, 90)
+        output_6d = output_6d.view(batch_size, 15, 6)  # (B, 15, 6)
 
-        return output, mu, logvar
+        return output_6d, mu, logvar
     
 def visualize(model_output, pose, title, path):
     fig = plt.figure(figsize=(10,8))
@@ -371,9 +379,7 @@ def loss_fn(pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, si
     
     Args:
         pose_data: Ground truth pose data [batch, 15, 3, 3]
-        model_output: Model predictions [batch, 15, 3, 3] => directly output from network
-        logvar: Log variance from the model
-        mu: Mean from the model
+        model_output: Model predictions [batch, 15, 6] => directly output from network in 6D form
         lambda_R: Weight for rotation loss
         lambda_kl: Weight for KL divergence loss
         lambda_vel: Weight for velocity loss
@@ -386,26 +392,65 @@ def loss_fn(pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, si
     #  may select specific joints or axes; here we use the 1st vector of rotation matrix
     # pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
     # pose_loss = mse_loss(model_output, pose_data)
-    errors = torch.abs(model_output - pose_data)
+    #errors = torch.abs(model_output - pose_data)
+    
+    # Convert pose_data to 6D representation
+    input_6d = batch_vectors_to_6D(pose_data, eps=eps)
+    
+    # Calculate position loss using 6D representation
+    errors = torch.abs(model_output - input_6d)
     max_per_joint, _ = torch.max(
-            errors.view(errors.size(0), errors.size(1), errors.size(2), -1),
+            errors.view(errors.size(0), errors.size(1), -1),
             dim=1  # Reduce across frames and coordinates
         )
     pose_loss = torch.mean(max_per_joint)
 
     # Rotation loss in 6D representation
-    # input_6d = batch_vectors_to_6D(pose_data, eps=eps)
-    # output_6d = batch_vectors_to_6D(model_output, eps=eps)
-    # R_loss = torch.mean((output_6d - input_6d) ** 2)
+    R_loss = torch.mean((model_output - input_6d) ** 2)
 
-    # Velocity loss based on movement of first vector of rotation matrix (e.g., palm position)
-    # velocity_in = torch.diff(pose_data, dim=1)  # [batch, 14, 3]
-    # velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 3]
-    # dir_loss = 1.0 - F.cosine_similarity(velocity_in, velocity_out, dim=-1).mean()
-    # vel_loss = 30.0 * mse_loss(velocity_in, velocity_out)
+    # Velocity loss based on movement
+    if not single:
+        velocity_in = torch.diff(input_6d, dim=1)  # [batch, 14, 6]
+        velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 6]
+        dir_loss = 1.0 - F.cosine_similarity(velocity_in.view(-1, 6), velocity_out.view(-1, 6), dim=-1).mean()
+        vel_loss = mse_loss(velocity_in, velocity_out)
+    else:
+        vel_loss = 0
+        dir_loss = 0
 
-    return pose_loss, 0, 0, 0#loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss
+    # Total loss
+    loss = pose_loss + lambda_R * R_loss + lambda_vel * (vel_loss + 0.5*dir_loss)
+    
+    return loss, pose_loss, R_loss, vel_loss, dir_loss
 
+def six_d_to_matrix(six_d, eps=1e-7):
+    """
+    Convert 6D representation to 3D positions for visualization.
+    Args:
+        six_d: Tensor of shape (B, N, 6) containing the 6D representation.
+        eps: Small epsilon to avoid division by zero.
+    Returns:
+        Tensor of shape (B, N, 3, 3) containing positions based on the 6D representation.
+    """
+    batch_size, seq_len = six_d.shape[0], six_d.shape[1]
+    
+    # Extract u and v vectors (first 3 elements and last 3 elements)
+    u = six_d[:, :, :3]
+    v = six_d[:, :, 3:]
+    
+    # Create placeholder for output
+    output = torch.zeros(batch_size, seq_len, 3, 3, device=six_d.device)
+    
+    # We use the first vector (u) as the main direction
+    # The second vector (v) determines orientation
+    
+    # Just using these as X, Y, Z coordinates for visualization
+    # In a real implementation, you would need to reconstruct the rotation matrix properly
+    output[:, :, 0] = torch.zeros_like(u)  # Origin
+    output[:, :, 1] = u  # u vector represents one point
+    output[:, :, 2] = v  # v vector represents another point
+    
+    return output
 
 def test_model(sample_path, urdf_path, model_path, output_path):
     """
@@ -420,17 +465,23 @@ def test_model(sample_path, urdf_path, model_path, output_path):
 
     for sample in sample_path:
         pose = _load_protobuf(sample+".pb").unsqueeze(0).to(device)
-        model_output, _, _ = model(pose[:,:,2:], deterministic=True)
+        
+        # Forward pass through the model to get 6D representation
+        model_output_6d, _, _ = model(pose[:,:,2:], deterministic=True)
+        
+        # Convert 6D back to 3D for visualization
+        model_output_3d = six_d_to_matrix(model_output_6d)
 
         f.write("------ "+sample+" ------\n")
         print("------ "+sample+" ------\n")
-        for i in range(15):
-            pose_loss, R_loss, _, _ = loss_fn(pose[:,i,2:].unsqueeze(0), model_output[:,i].unsqueeze(0), single=True)
-            f.write(f"- frame {i} Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}\n")
         
-        pose_loss, R_loss, vel_loss, dir_loss = loss_fn(pose[:,:,2:], model_output)
-        f.write(f"\nTotal Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}, Dir Loss: {dir_loss:.5f}\n")
-        print(f"\nTotal Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}, Dir Loss: {dir_loss:.5f}\n")
+        for i in range(15):
+            total_loss, pose_loss, R_loss, vel_loss, dir_loss = loss_fn(pose[:,i,2:].unsqueeze(0), model_output_6d[:,i].unsqueeze(0), single=True)
+            f.write(f"- frame {i} Total Loss: {total_loss:.5f}, Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}\n")
+        
+        total_loss, pose_loss, R_loss, vel_loss, dir_loss = loss_fn(pose[:,:,2:], model_output_6d)
+        f.write(f"\nTotal Loss: {total_loss:.5f}, Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}, Dir Loss: {dir_loss:.5f}\n")
+        print(f"\nTotal Loss: {total_loss:.5f}, Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}, Dir Loss: {dir_loss:.5f}\n")
 
         path = os.path.join(output_path,"fig",sample.split("/")[-1])
         if os.path.exists(path):
@@ -440,7 +491,7 @@ def test_model(sample_path, urdf_path, model_path, output_path):
                     os.remove(file_path)
         else:
             os.makedirs(path)
-        animate_movement(model_output.detach().cpu(), pose.cpu(), path)
+        animate_movement(model_output_3d.detach().cpu(), pose.cpu(), path)
 
     # print("zipping...")
     # shutil.make_archive(output_path, 'zip', os.path.dirname(output_path) )

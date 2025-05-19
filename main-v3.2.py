@@ -315,6 +315,9 @@ class PoseVideoCNNRNN(nn.Module):
             nn.ReLU(),
             nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
         )
+        
+        # transform 3x3 representation to 6d representation
+        self.fc_output = nn.Linear(15 * 3 * 3, 15 * 6)
 
     def forward(self, input_data, deterministic=False):
         batch_size, seq_len = input_data.shape[0], input_data.shape[1]
@@ -336,8 +339,13 @@ class PoseVideoCNNRNN(nn.Module):
         h = self.fc_decode(embedding)
         output = self.decoder(h)
         output = output.squeeze(1)
+        
+        # transform to 6D representation
+        output_flat = output.view(batch_size, -1)  # (B, 135)
+        output_6d = self.fc_output(output_flat)  # (B, 90)
+        output_6d = output_6d.view(batch_size, 15, 6)  # (B, 15, 6)
 
-        return output, mu, logvar
+        return output_6d, mu, logvar
 
 
 class ForwardKinematics:
@@ -557,11 +565,6 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     # Stack u and v_ortho to form 6D representation
     six_d = torch.cat([u, v_ortho], dim=-1)
     return six_d
- #import torch
-import torch.nn.functional as F
-from torch.nn import MSELoss
-
-mse_loss = MSELoss()
 
 def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
     """
@@ -569,7 +572,7 @@ def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, la
     
     Args:
         pose_data: Ground truth pose data [batch, 15, 3, 3]
-        model_output: Model predictions [batch, 15, 3, 3] => directly output from network
+        model_output: Model predictions [batch, 15, 6] => directly output from network in 6D form
         logvar: Log variance from the model
         mu: Mean from the model
         lambda_R: Weight for rotation loss
@@ -580,13 +583,13 @@ def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, la
     Returns:
         Tuple of total loss and individual loss components
     """
-    # Position loss (e.g., difference in palm position)
-    #  may select specific joints or axes; here we use the 1st vector of rotation matrix
-    # pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
-    # pose_loss = mse_loss(model_output, pose_data)
-    errors = torch.abs(model_output - pose_data)
+    # convert pose_data to 6d representation
+    input_6d = batch_vectors_to_6D(pose_data, eps=eps)
+    
+    # calculate position loss using 6d representation
+    errors = torch.abs(model_output - input_6d)
     max_per_joint, _ = torch.max(
-            errors.view(errors.size(0), errors.size(1), errors.size(2), -1),
+            errors.view(errors.size(0), errors.size(1), -1),
             dim=1  # Reduce across frames and coordinates
         )
     pose_loss = torch.mean(max_per_joint)
@@ -598,17 +601,18 @@ def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, la
     # input_6d = batch_vectors_to_6D(pose_data, eps=eps)
     # output_6d = batch_vectors_to_6D(model_output, eps=eps)
     # R_loss = torch.mean((output_6d - input_6d) ** 2)
+    R_loss = torch.mean((model_output - input_6d) ** 2)
 
     # Velocity loss based on movement of first vector of rotation matrix (e.g., palm position)
-    # velocity_in = torch.diff(pose_data, dim=1)  # [batch, 14, 3]
-    # velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 3]
-    # dir_loss = 1.0 - F.cosine_similarity(velocity_in, velocity_out, dim=-1).mean()
-    # vel_loss = 30.0 * mse_loss(velocity_in, velocity_out)
+    velocity_in = torch.diff(input_6d, dim=1)  # [batch, 14, 6]
+    velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 6]
+    dir_loss = 1.0 - F.cosine_similarity(velocity_in.view(-1, 6), velocity_out.view(-1, 6), dim=-1).mean()
+    vel_loss = mse_loss(velocity_in, velocity_out)
 
     # Combine all loss terms
-    loss = pose_loss + lambda_kl * kl_loss #+ lambda_R * R_loss + lambda_vel * (vel_loss + 0.5*dir_loss)
+    loss = pose_loss + lambda_kl * kl_loss + lambda_R * R_loss + lambda_vel * (vel_loss + 0.5*dir_loss)
 
-    return loss, pose_loss, 0, kl_loss, 0, 0#loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss
+    return loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss
 
 def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0.5):
     """Linear warmup for velocity loss coefficient"""
