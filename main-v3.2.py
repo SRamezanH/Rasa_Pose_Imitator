@@ -275,7 +275,7 @@ class PoseVideoDataset(Dataset):
         elif num_frames > 15:
             pose_tensor = pose_tensor[:15, :, :]
 
-        return pose_tensor
+        return batch_vectors_to_6D(pose_tensor)
 
 
 # Neural Network Model Definition
@@ -451,7 +451,7 @@ class ForwardKinematics:
             (finger4_pos - shoulder_pos) / self.L_ref,
         ], dim=2).view(batch_size, seq_len, 3, 3)
         
-        return normalized.to(device)
+        return batch_vectors_to_6D(normalized.to(device))
 
 def test_dataset(data_dir):
     """
@@ -563,10 +563,10 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
     
     # Stack u and v_ortho to form 6D representation
-    six_d = torch.cat([u, v_ortho], dim=-1)
+    six_d = torch.cat([root, root+0.1*u, root+0.1*v_ortho], dim=-1)
     return six_d
 
-def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
+def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
     """
     Computes the loss between the predicted and actual pose data (no FK needed)
     
@@ -583,11 +583,9 @@ def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, la
     Returns:
         Tuple of total loss and individual loss components
     """
-    # convert pose_data to 6d representation
-    input_6d = batch_vectors_to_6D(pose_data, eps=eps)
-    
+    kine_output = fk.batch_forward_kinematics(model_output)    
     # calculate position loss using 6d representation
-    errors = torch.abs(model_output - input_6d)
+    errors = torch.abs(kine_output - pose_data)
     max_per_joint, _ = torch.max(
             errors.view(errors.size(0), errors.size(1), -1),
             dim=1  # Reduce across frames and coordinates
@@ -601,18 +599,18 @@ def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, la
     # input_6d = batch_vectors_to_6D(pose_data, eps=eps)
     # output_6d = batch_vectors_to_6D(model_output, eps=eps)
     # R_loss = torch.mean((output_6d - input_6d) ** 2)
-    R_loss = torch.mean((model_output - input_6d) ** 2)
+    # R_loss = torch.mean((model_output - input_6d) ** 2)
 
     # Velocity loss based on movement of first vector of rotation matrix (e.g., palm position)
-    velocity_in = torch.diff(input_6d, dim=1)  # [batch, 14, 6]
-    velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 6]
-    dir_loss = 1.0 - F.cosine_similarity(velocity_in.view(-1, 6), velocity_out.view(-1, 6), dim=-1).mean()
-    vel_loss = mse_loss(velocity_in, velocity_out)
+    # velocity_in = torch.diff(input_6d, dim=1)  # [batch, 14, 6]
+    # velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 6]
+    # dir_loss = 1.0 - F.cosine_similarity(velocity_in.view(-1, 6), velocity_out.view(-1, 6), dim=-1).mean()
+    # vel_loss = mse_loss(velocity_in, velocity_out)
 
     # Combine all loss terms
-    loss = pose_loss + lambda_kl * kl_loss + lambda_R * R_loss + lambda_vel * (vel_loss + 0.5*dir_loss)
+    loss = pose_loss + lambda_kl * kl_loss #+ lambda_R * R_loss + lambda_vel * (vel_loss + 0.5*dir_loss)
 
-    return loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss
+    return loss, pose_loss, 0, kl_loss, 0, 0#R_loss, kl_loss, vel_loss, dir_loss
 
 def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0.5):
     """Linear warmup for velocity loss coefficient"""
@@ -709,7 +707,7 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
 
 
     # Initialize forward kinematics
-    #fk = ForwardKinematics(urdf_path)
+    fk = ForwardKinematics(urdf_path)
     
     # Import tqdm for progress bars
     from tqdm import tqdm
@@ -757,7 +755,7 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
             model_output, mu, logvar = model(pose_data)  # Output: [batch, 15, 6] (predicted)
 
             # Compute loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
@@ -783,10 +781,10 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
             batch_pbar.set_postfix({
                 'loss': f'{loss_val:.2f}', 
                 'pose_loss': f'{pose_loss_val:.2f}', 
-                'R_loss': f'{R_loss_val:.2f}', 
+                # 'R_loss': f'{R_loss_val:.2f}', 
                 'kl_loss': f'{kl_loss_val:.2f}', 
-                'vel_loss': f'{vel_loss_val:.2f}', 
-                'dir_loss': f'{dir_loss_val:.2f}'
+                # 'vel_loss': f'{vel_loss_val:.2f}', 
+                # 'dir_loss': f'{dir_loss_val:.2f}'
             })
         
         total_loss /= len(train_loader)
@@ -823,7 +821,7 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
                 model_output, mu, logvar = model(pose_data)
 
                 # Compute loss
-                loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+                loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
                 
                 loss_val = loss
                 pose_loss_val = pose_loss
@@ -843,10 +841,10 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
                 eval_pbar.set_postfix({
                     'loss': f'{loss_val:.2f}', 
                     'pose_loss': f'{pose_loss_val:.2f}', 
-                    'R_loss': f'{R_loss_val:.2f}', 
+                    # 'R_loss': f'{R_loss_val:.2f}', 
                     'kl_loss': f'{kl_loss_val:.2f}', 
-                    'vel_loss': f'{vel_loss_val:.2f}', 
-                    'dir_loss': f'{dir_loss_val:.2f}'
+                    # 'vel_loss': f'{vel_loss_val:.2f}', 
+                    # 'dir_loss': f'{dir_loss_val:.2f}'
                 })
         eval_loss /= len(eval_loader)
         eval_pose_loss /= len(eval_loader)
@@ -880,10 +878,10 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
 
         # Print epoch summary
         print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s\n" 
-              f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, R Loss: {total_R_loss:.5f}, "
-              f"KL Loss: {total_kl_loss:.5f}, Vel Loss: {total_vel_loss:.5f}, dir Loss: {total_dir_loss:.5f}\n"
-              f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, R Loss: {eval_R_loss:.5f}, "
-              f"KL Loss: {eval_kl_loss:.5f}, Vel Loss: {eval_vel_loss:.5f}, dir Loss: {eval_dir_loss:.5f}")
+              f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f},"# R Loss: {total_R_loss:.5f}, "
+              f"KL Loss: {total_kl_loss:.5f}\n"#, Vel Loss: {total_vel_loss:.5f}, dir Loss: {total_dir_loss:.5f}\n"
+              f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f},"# R Loss: {eval_R_loss:.5f}, "
+              f"KL Loss: {eval_kl_loss:.5f}")#, Vel Loss: {eval_vel_loss:.5f}, dir Loss: {eval_dir_loss:.5f}")
         
     print(f"\nTraining completed in {num_epochs} epochs")
 
@@ -913,7 +911,7 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
     #         model_output, mu, logvar = model(pose_data)
             
     #         # Compute Loss
-    #         loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+    #         loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
 
     #         test_loss += loss
     #         test_pose_loss += pose_loss
