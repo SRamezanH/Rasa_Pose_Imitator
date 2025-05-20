@@ -563,7 +563,7 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
     
     # Stack u and v_ortho to form 6D representation
-    six_d = torch.stack([root, root+0.1*u, root+0.1*v_ortho])
+    six_d = torch.stack([root, root+0.1*u, root+0.1*v_ortho], dim=-1)
     return six_d
 
 def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
