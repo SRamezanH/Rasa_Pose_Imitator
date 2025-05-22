@@ -231,7 +231,7 @@ class PoseVideoCNNRNN(nn.Module):
             nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
         )
         
-        # Transform 3x3 representation to 6D representation
+        # transform 3x3 representation to 6d representation
         self.fc_output = nn.Linear(15 * 3 * 3, 15 * 6)
 
     def forward(self, input_data, deterministic=False):
@@ -255,99 +255,255 @@ class PoseVideoCNNRNN(nn.Module):
         output = self.decoder(h)
         output = output.squeeze(1)
         
-        # Transform to 6D representation
+        # transform to 6D representation
         output_flat = output.view(batch_size, -1)  # (B, 135)
         output_6d = self.fc_output(output_flat)  # (B, 90)
         output_6d = output_6d.view(batch_size, 15, 6)  # (B, 15, 6)
 
         return output_6d, mu, logvar
-    
-def visualize(model_output, pose, title, path):
-    fig = plt.figure(figsize=(10,8))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    # ax.view_init(elev = 0, azim = 90)
 
-    ax.set_box_aspect([1,1,1])
-    # Clear previous plot
-    ax.clear()
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    # Compute forward kinematics
-    
-    # Draw joints
-    # for name, pos in positions.items():
-    # pose = pose *0.2
-    dx = 0
-    dy = 0
-    dz = 0
-    x = [dx + pose[0,0], dx + pose[1,0]]
-    y = [dy + pose[0,1], dy + pose[1,1]]
-    z = [dz + pose[0,2], dz + pose[1,2]]
-    ax.plot(x, y, z, 'r-', linewidth=2)
-    x = [dx + pose[1,0], dx + pose[2,0]]
-    y = [dy + pose[1,1], dy + pose[2,1]]
-    z = [dz + pose[1,2], dz + pose[2,2]]
-    ax.plot(x, y, z, 'r-', linewidth=2)
-    x = [dx + pose[2,0], dx + pose[3,0]]
-    y = [dy + pose[2,1], dy + pose[3,1]]
-    z = [dz + pose[2,2], dz + pose[3,2]]
-    ax.plot(x, y, z, 'r-', linewidth=2)
-    x = [dx + pose[2,0], dx + pose[4,0]]
-    y = [dy + pose[2,1], dy + pose[4,1]]
-    z = [dz + pose[2,2], dz + pose[4,2]]
-    ax.plot(x, y, z, 'r-', linewidth=2)
-    x = [dx + pose[3,0], dx + pose[4,0]]
-    y = [dy + pose[3,1], dy + pose[4,1]]
-    z = [dz + pose[3,2], dz + pose[4,2]]
-    ax.plot(x, y, z, 'r-', linewidth=2)
+class ForwardKinematics:
+    def __init__(self, urdf_path):
+        """
+        Initialize a forward kinematics model using a URDF file
 
-    x = [dx + model_output[0,0], dx + model_output[1,0]]
-    y = [dy + model_output[0,1], dy + model_output[1,1]]
-    z = [dz + model_output[0,2], dz + model_output[1,2]]
-    ax.plot(x, y, z, 'b-', linewidth=2)
-    x = [dx + model_output[0,0], dx + model_output[2,0]]
-    y = [dy + model_output[0,1], dy + model_output[2,1]]
-    z = [dz + model_output[0,2], dz + model_output[2,2]]
-    ax.plot(x, y, z, 'b-', linewidth=2)
-    x = [dx + model_output[1,0], dx + model_output[2,0]]
-    y = [dy + model_output[1,1], dy + model_output[2,1]]
-    z = [dz + model_output[1,2], dz + model_output[2,2]]
-    ax.plot(x, y, z, 'b-', linewidth=2)
-    
-    # Set plot limits
-    all_pos = np.array(list(model_output))
-    all_pos_2 = np.array(list(pose))
-    max_range = max(np.max(np.abs(all_pos)), np.max(np.abs(all_pos_2))) * 1.1
-    ax.set_xlim([-max_range, max_range])
-    ax.set_ylim([-max_range, max_range])
-    ax.set_zlim([-max_range, max_range])
-    
-    ax.set_title(title)
-    ax.view_init(elev = 0, azim = 90)
-    # plt.draw()
-    plt.savefig(os.path.join(path, f'front {title}.png'))
-    ax.view_init(elev = 0, azim = 180)
-    plt.savefig(os.path.join(path, f'right {title}.png'))
-    ax.view_init(elev = 90, azim = 90)
-    plt.savefig(os.path.join(path, f'up {title}.png'))
+        Args:
+            urdf_path (str): Path to the URDF file
+        """
+        self.urdf_path = urdf_path
+        self.robot_chain = None
+        self.all_joints = None
+        self.joint_limits = {}
+        self.selected_joints = [
+            "right_Shoulder_1",
+            "right_Shoulder_2",
+            "right_Shoulder_3",
+            "right_Elbow_1",
+            "right_Elbow_2",
+            "right_Wrist"
+        ]
 
-    # plt.pause(0.3)
+        self.load_robot()
+        self._precompute_body_references()
+
+    def load_robot(self):
+        """Load robot model from URDF file and extract joint limits"""
+        # Load URDF and build kinematic chain
+        with open(self.urdf_path, "r") as f:
+            urdf_content = f.read()
+        self.robot_chain = pk.build_chain_from_urdf(urdf_content)
+        self.all_joints = self.robot_chain.get_joint_parameter_names()
+
+        # Extract joint limits
+        tree = ET.parse(self.urdf_path)
+        root = tree.getroot()
+        for joint in root.findall("joint"):
+            joint_name = joint.get("name")
+            limit = joint.find("limit")
+            if limit is not None and joint_name in self.all_joints:
+                lower = float(limit.get("lower", "0"))
+                upper = float(limit.get("upper", "0"))
+                self.joint_limits[joint_name] = (lower, upper)
+        
+        self.selected_indices = [
+            self.all_joints.index(j) 
+            for j in self.selected_joints 
+            if j in self.all_joints
+        ]
+
+        # Parse URDF to get link hierarchy (simplified)
+        self.link_parents = self._parse_urdf_hierarchy()
+
+        # Convert to tensors in order of selected_joints
+        self.joint_lowers = torch.tensor([self.joint_limits[j][0] for j in self.selected_joints])
+        self.joint_uppers = torch.tensor([self.joint_limits[j][1] for j in self.selected_joints])
+        self.joint_ranges = self.joint_uppers - self.joint_lowers
+
+        print("Kinematic chain initialized")
+
+    def _precompute_body_references(self):
+        """Precompute reference points and lengths using zero joint angles"""
+        with torch.no_grad():
+            zero_joints = torch.zeros(len(self.all_joints))
+            fk_result = self.robot_chain.forward_kinematics(zero_joints)
+            
+            # Precompute reference points
+            shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+            forearm_pos = fk_result["right_Forearm_1"].get_matrix()[:, :3, 3]
+            wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
+            
+            # Calculate reference length
+            self.L_ref = (torch.norm(shoulder_pos - forearm_pos) + 
+                          torch.norm(wrist_pos - forearm_pos)) / 2.0
+
+    def batch_forward_kinematics(self, batch_joint_values):
+        """
+        Compute forward kinematics for a batch of joint values
+
+        Args:
+            batch_joint_values (torch.Tensor): Tensor with shape [batch_size, seq_len, num_joints]
+                containing joint values
+
+        Returns:
+            torch.Tensor: Tensor with shape [batch_size, seq_len, num_links*3] containing 3D positions
+                of important links
+        """
+        batch_size, seq_len, _ = batch_joint_values.shape
+
+        denormalized = (batch_joint_values.cpu() * self.joint_ranges) + self.joint_lowers
+        full_joints = torch.zeros((batch_size, seq_len, len(self.all_joints)))
+        full_joints[:, :, self.selected_indices] = denormalized
+        joints_flat = full_joints.view(-1, len(self.all_joints))
+        fk_result = self.robot_chain.forward_kinematics(joints_flat)
+        
+        # 4. Extract and normalize positions
+        shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+        wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
+        finger1_pos = fk_result["right_Finger_1_1"].get_matrix()[:, :3, 3]
+        finger4_pos = fk_result["right_Finger_4_1"].get_matrix()[:, :3, 3]
+        
+        normalized = torch.stack([
+            (wrist_pos - shoulder_pos) / self.L_ref,
+            (finger1_pos - shoulder_pos) / self.L_ref,
+            (finger4_pos - shoulder_pos) / self.L_ref,
+        ], dim=2).view(batch_size, seq_len, 3, 3)
+        
+        return batch_vectors_to_6D(normalized.to(device))
     
-def animate_movement(model_output, pose, path):
-    """
-    Animate a sequence of joint angle configurations
+    def forward_kinematics(self, batch_joint_values):
+        """
+        Compute forward kinematics for a batch of joint values
+
+        Args:
+            batch_joint_values (torch.Tensor): Tensor with shape [batch_size, seq_len, num_joints]
+                containing joint values
+
+        Returns:
+            torch.Tensor: Tensor with shape [batch_size, seq_len, num_links*3] containing 3D positions
+                of important links
+        """
+        batch_size, seq_len, _ = batch_joint_values.shape
+        output_positions = []
+
+        for b in range(batch_size):
+            for t in range(seq_len):
+                joint_values = batch_joint_values[b, t, :]
+                full_joint_values = torch.zeros(len(self.all_joints))
+                for i, joint_name in enumerate(self.selected_joints):
+                    if joint_name in self.joint_limits:
+                        lower, upper = self.joint_limits[joint_name]
+                        denormalized_value = (joint_values[i] * (upper - lower)) + lower
+                        full_joint_values[self.all_joints.index(joint_name)] = denormalized_value
+                output_positions.append(self.robot_chain.forward_kinematics(full_joint_values.unsqueeze(0)))
+
+        return output_positions
     
-    Args:
-        joint_angle_sequence: List of dictionaries containing joint angles
-    """
-    _, seq, _, _ = pose.shape
-    for i in range(seq):
-        visualize(model_output[0,i], pose[0,i], f"Pose {i+1} of {seq}", path)
-        # plt.pause(1.0)
+    def _parse_urdf_hierarchy(self) -> Dict[str, str]:
+        """
+        Simplified URDF parser to get link parent-child relationships
+        Returns dictionary of {child: parent}
+        """
+        # In practice, you'd want to use a proper URDF parser here
+        # This is a simplified version that might need adjustment
+        
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(self.urdf_path)
+        root = tree.getroot()
+        
+        hierarchy = {}
+        for joint in root.findall('joint'):
+            parent = joint.find('parent').get('link')
+            child = joint.find('child').get('link')
+            hierarchy[child] = parent
+        
+        return hierarchy
+
+    def visualize(self, fk_result, pose, title, path):
+        fig = plt.figure(figsize=(10,8))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        # ax.view_init(elev = 0, azim = 90)
+
+        ax.set_box_aspect([1,1,1])
+        # Clear previous plot
+        ax.clear()
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        # Compute forward kinematics
+        # Compute forward kinematics
+        positions = {}
+        origin = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+        for name, tf in fk_result.items():
+            pos = tf.get_matrix()[:, :3, 3].detach().numpy()  # Extract translation component
+            positions[name] = (pos - origin) / self.L_ref
+        
+        # Draw connections based on hierarchy
+        for child, parent in self.link_parents.items():
+            if parent in positions and child in positions:
+                x = [positions[parent][0,0], positions[child][0,0]]
+                y = [positions[parent][0,1], positions[child][0,1]]
+                z = [positions[parent][0,2], positions[child][0,2]]
+                ax.plot(x, y, z, 'b-', linewidth=2)
+        # Draw joints
+        # for name, pos in positions.items():
+        # pose = pose *0.2
+        dx = 0
+        dy = 0
+        dz = 0
+        x = [dx + pose[0,0], dx + pose[1,0]]
+        y = [dy + pose[0,1], dy + pose[1,1]]
+        z = [dz + pose[0,2], dz + pose[1,2]]
+        ax.plot(x, y, z, 'r-', linewidth=2)
+        x = [dx + pose[1,0], dx + pose[2,0]]
+        y = [dy + pose[1,1], dy + pose[2,1]]
+        z = [dz + pose[1,2], dz + pose[2,2]]
+        ax.plot(x, y, z, 'r-', linewidth=2)
+        x = [dx + pose[2,0], dx + pose[3,0]]
+        y = [dy + pose[2,1], dy + pose[3,1]]
+        z = [dz + pose[2,2], dz + pose[3,2]]
+        ax.plot(x, y, z, 'r-', linewidth=2)
+        x = [dx + pose[2,0], dx + pose[4,0]]
+        y = [dy + pose[2,1], dy + pose[4,1]]
+        z = [dz + pose[2,2], dz + pose[4,2]]
+        ax.plot(x, y, z, 'r-', linewidth=2)
+        x = [dx + pose[3,0], dx + pose[4,0]]
+        y = [dy + pose[3,1], dy + pose[4,1]]
+        z = [dz + pose[3,2], dz + pose[4,2]]
+        ax.plot(x, y, z, 'r-', linewidth=2)
+        
+        # Set plot limits
+        all_pos = np.array(list(positions.values()))
+        all_pos_2 = np.array(list(pose))
+        max_range = max(np.max(np.abs(all_pos)), np.max(np.abs(all_pos_2))) * 1.1
+        ax.set_xlim([-max_range, max_range])
+        ax.set_ylim([-max_range, max_range])
+        ax.set_zlim([-max_range, max_range])
+        
+        ax.set_title(title)
+        ax.view_init(elev = 0, azim = 90)
+        # plt.draw()
+        plt.savefig(os.path.join(path, f'front {title}.png'))
+        ax.view_init(elev = 0, azim = 180)
+        plt.savefig(os.path.join(path, f'right {title}.png'))
+        ax.view_init(elev = 90, azim = 90)
+        plt.savefig(os.path.join(path, f'up {title}.png'))
+
+        # plt.pause(0.3)
+    
+    def animate_movement(self, batch_joint_values, pose, path):
+        """
+        Animate a sequence of joint angle configurations
+        
+        Args:
+            joint_angle_sequence: List of dictionaries containing joint angles
+        """
+        positions = self.forward_kinematics(batch_joint_values)
+        for i, fk in enumerate(positions):
+            self.visualize(fk, pose[0,i], f"Pose {i+1} of {len(positions)}", path)
+            # plt.pause(1.0)
 
 def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """
@@ -370,10 +526,10 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
     
     # Stack u and v_ortho to form 6D representation
-    six_d = torch.cat([u, v_ortho], dim=-1)
+    six_d = torch.stack([root, root+0.1*u, root+0.1*v_ortho], dim=-1)
     return six_d
 
-def loss_fn(pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, single=False):
+def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, single=False):
     """
     Computes the loss between the predicted and actual pose data (no FK needed)
     
@@ -395,62 +551,17 @@ def loss_fn(pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, si
     #errors = torch.abs(model_output - pose_data)
     
     # Convert pose_data to 6D representation
-    input_6d = batch_vectors_to_6D(pose_data, eps=eps)
-    
-    # Calculate position loss using 6D representation
-    errors = torch.abs(model_output - input_6d)
+    kine_output = fk.batch_forward_kinematics(model_output)  
+    pose_data = batch_vectors_to_6D(pose_data)
+    # calculate position loss using 6d representation
+    errors = torch.abs(kine_output - pose_data)
     max_per_joint, _ = torch.max(
             errors.view(errors.size(0), errors.size(1), -1),
             dim=1  # Reduce across frames and coordinates
         )
     pose_loss = torch.mean(max_per_joint)
 
-    # Rotation loss in 6D representation
-    R_loss = torch.mean((model_output - input_6d) ** 2)
-
-    # Velocity loss based on movement
-    if not single:
-        velocity_in = torch.diff(input_6d, dim=1)  # [batch, 14, 6]
-        velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 6]
-        dir_loss = 1.0 - F.cosine_similarity(velocity_in.view(-1, 6), velocity_out.view(-1, 6), dim=-1).mean()
-        vel_loss = mse_loss(velocity_in, velocity_out)
-    else:
-        vel_loss = 0
-        dir_loss = 0
-
-    # Total loss
-    loss = pose_loss + lambda_R * R_loss + lambda_vel * (vel_loss + 0.5*dir_loss)
-    
-    return loss, pose_loss, R_loss, vel_loss, dir_loss
-
-def six_d_to_matrix(six_d, eps=1e-7):
-    """
-    Convert 6D representation to 3D positions for visualization.
-    Args:
-        six_d: Tensor of shape (B, N, 6) containing the 6D representation.
-        eps: Small epsilon to avoid division by zero.
-    Returns:
-        Tensor of shape (B, N, 3, 3) containing positions based on the 6D representation.
-    """
-    batch_size, seq_len = six_d.shape[0], six_d.shape[1]
-    
-    # Extract u and v vectors (first 3 elements and last 3 elements)
-    u = six_d[:, :, :3]
-    v = six_d[:, :, 3:]
-    
-    # Create placeholder for output
-    output = torch.zeros(batch_size, seq_len, 3, 3, device=six_d.device)
-    
-    # We use the first vector (u) as the main direction
-    # The second vector (v) determines orientation
-    
-    # Just using these as X, Y, Z coordinates for visualization
-    # In a real implementation, you would need to reconstruct the rotation matrix properly
-    output[:, :, 0] = torch.zeros_like(u)  # Origin
-    output[:, :, 1] = u  # u vector represents one point
-    output[:, :, 2] = v  # v vector represents another point
-    
-    return output
+    return pose_loss
 
 def test_model(sample_path, urdf_path, model_path, output_path):
     """
@@ -461,27 +572,26 @@ def test_model(sample_path, urdf_path, model_path, output_path):
     model.load_state_dict(torch.load(model_path, weights_only=True))
     model.eval()
 
+    fk = ForwardKinematics(urdf_path)
+
     f = open(os.path.join(output_path, "results.log"), 'w')
 
     for sample in sample_path:
         pose = _load_protobuf(sample+".pb").unsqueeze(0).to(device)
         
         # Forward pass through the model to get 6D representation
-        model_output_6d, _, _ = model(pose[:,:,2:], deterministic=True)
-        
-        # Convert 6D back to 3D for visualization
-        model_output_3d = six_d_to_matrix(model_output_6d)
+        model_output, _, _ = model(pose[:,:,2:], deterministic=True)
 
         f.write("------ "+sample+" ------\n")
         print("------ "+sample+" ------\n")
         
         for i in range(15):
-            total_loss, pose_loss, R_loss, vel_loss, dir_loss = loss_fn(pose[:,i,2:].unsqueeze(0), model_output_6d[:,i].unsqueeze(0), single=True)
-            f.write(f"- frame {i} Total Loss: {total_loss:.5f}, Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}\n")
+            pose_loss = loss_fn(fk, pose[:,i,2:].unsqueeze(0), model_output[:,i].unsqueeze(0), single=True)
+            f.write(f"- frame {i} Pose Loss: {pose_loss:.5f}\n")
         
-        total_loss, pose_loss, R_loss, vel_loss, dir_loss = loss_fn(pose[:,:,2:], model_output_6d)
-        f.write(f"\nTotal Loss: {total_loss:.5f}, Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}, Dir Loss: {dir_loss:.5f}\n")
-        print(f"\nTotal Loss: {total_loss:.5f}, Pose Loss: {pose_loss:.5f}, R Loss: {R_loss:.5f}, Vel Loss: {vel_loss:.5f}, Dir Loss: {dir_loss:.5f}\n")
+        pose_loss = loss_fn(fk, pose[:,:,2:], model_output)
+        f.write(f"\nPose Loss: {pose_loss:.5f}\n")
+        print(f"\nPose Loss: {pose_loss:.5f}\n")
 
         path = os.path.join(output_path,"fig",sample.split("/")[-1])
         if os.path.exists(path):
@@ -491,7 +601,7 @@ def test_model(sample_path, urdf_path, model_path, output_path):
                     os.remove(file_path)
         else:
             os.makedirs(path)
-        animate_movement(model_output_3d.detach().cpu(), pose.cpu(), path)
+        fk.animate_movement(model_output, pose.cpu(), path)
 
     # print("zipping...")
     # shutil.make_archive(output_path, 'zip', os.path.dirname(output_path) )
@@ -507,7 +617,7 @@ def main():
                 "/home/cedra/psl_project/5_dataset/IRIB2_48_13327_842-856_left",
                 "/home/cedra/psl_project/5_dataset/Deafinno_1036_36-50_left"]
 
-    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_98_best.pth"
+    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_100_best.pth"
 
     urdf_path="/home/cedra/psl_project/rasa/hand.urdf"
 
