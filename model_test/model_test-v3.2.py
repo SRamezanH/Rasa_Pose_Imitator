@@ -232,7 +232,10 @@ class PoseVideoCNNRNN(nn.Module):
         )
         
         # transform 3x3 representation to 6d representation
-        self.fc_output = nn.Linear(15 * 3 * 3, 15 * 6)
+        self.fc_output = nn.Sequential(
+            nn.Linear(15 * 3 * 3, 15 * 6),
+            nn.Sigmoid()
+        )
 
     def forward(self, input_data, deterministic=False):
         batch_size, seq_len = input_data.shape[0], input_data.shape[1]
