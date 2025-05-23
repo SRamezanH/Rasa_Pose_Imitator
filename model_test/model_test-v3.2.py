@@ -115,10 +115,34 @@ class ProtobufProcessor:
         origin = landmarks[1].clone().detach()
         # Compute the distance between the shoulder and elbow as the scale factor
         L = (torch.linalg.vector_norm(landmarks[1] - landmarks[3]) + torch.linalg.vector_norm(landmarks[3] - landmarks[5])).clone().detach()/2.0
+        indices = [5, 7, 9]
+        if left_side:
+            indices = [4, 6, 8]
+            landmarks[:, 0] *= -1
+            origin = landmarks[0].clone().detach()
+            # Compute the distance between the shoulder and elbow as the scale factor
+            L = (torch.linalg.vector_norm(landmarks[0] - landmarks[2]) + torch.linalg.vector_norm(landmarks[4] - landmarks[2])).clone().detach()/2.0
+        
+        L = L if L > 0 else 1.0  # Prevent division by zero
+
+        landmarks = (landmarks - origin) / L # Wrist as reference
+
+        # Normalize hand landmarks
+        return landmarks[indices].unsqueeze(0)
+    
+    @staticmethod
+    def normalize_body_landmarks_for_viz(landmarks, left_side):
+        """Normalize body landmarks using shoulders as reference points"""
+        if landmarks.shape[0] < 10:
+            return torch.zeros((1, 5, 3))  # Return zero if less than 2 landmarks
+        
+        origin = landmarks[1].clone().detach()
+        # Compute the distance between the shoulder and elbow as the scale factor
+        L = (torch.linalg.vector_norm(landmarks[1] - landmarks[3]) + torch.linalg.vector_norm(landmarks[3] - landmarks[5])).clone().detach()/2.0
         indices = [1, 3, 5, 7, 9]
         if left_side:
             indices = [0, 2, 4, 6, 8]
-            landmarks[:, 0] *= -1
+            # landmarks[:, 0] *= -1
             origin = landmarks[0].clone().detach()
             # Compute the distance between the shoulder and elbow as the scale factor
             L = (torch.linalg.vector_norm(landmarks[0] - landmarks[2]) + torch.linalg.vector_norm(landmarks[4] - landmarks[2])).clone().detach()/2.0
@@ -144,7 +168,8 @@ def _load_protobuf(pb_path):
     proto_data = ProtobufProcessor.load_protobuf_data(pb_path)
     left_side = pb_path.endswith("_left.pb")
 
-    pose_tensor = torch.empty([0, 5, 3], dtype=torch.float32)
+    pose_tensor = torch.empty([0, 3, 3], dtype=torch.float32)
+    viz_tensor = torch.empty([0, 5, 3], dtype=torch.float32)
 
     for frame in proto_data.frames:
         # Extract and normalize landmarks for body, left hand, and right hand
@@ -155,8 +180,10 @@ def _load_protobuf(pb_path):
         # Normalize the extracted landmarks
         # selected_landmarks, h = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
         selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
+        selected_landmarks_for_viz = ProtobufProcessor.normalize_body_landmarks_for_viz(pose_landmarks, left_side)
 
         pose_tensor = torch.cat((pose_tensor, selected_landmarks), dim=0)
+        viz_tensor = torch.cat((viz_tensor, selected_landmarks_for_viz), dim=0)
         # break
 
     pose_tensor = pose_tensor.to(device)
@@ -170,7 +197,7 @@ def _load_protobuf(pb_path):
     elif num_frames > 15:
         pose_tensor = pose_tensor[:15, :, :]
 
-    return pose_tensor
+    return batch_vectors_to_6D(pose_tensor), viz_tensor
 
 def _load_video(self, video_path):
     """
@@ -438,10 +465,10 @@ class ForwardKinematics:
         # Compute forward kinematics
         # Compute forward kinematics
         positions = {}
-        origin = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+        origin = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3].detach().numpy()
         for name, tf in fk_result.items():
             pos = tf.get_matrix()[:, :3, 3].detach().numpy()  # Extract translation component
-            positions[name] = (pos - origin.detach().numpy()) / self.L_ref.detach().numpy()
+            positions[name] = (pos - origin) / self.L_ref.detach().numpy()
         
         # Draw connections based on hierarchy
         for child, parent in self.link_parents.items():
@@ -555,7 +582,6 @@ def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7
     
     # Convert pose_data to 6D representation
     kine_output = fk.batch_forward_kinematics(model_output)  
-    pose_data = batch_vectors_to_6D(pose_data)
     # calculate position loss using 6d representation
     errors = torch.abs(kine_output - pose_data)
     max_per_joint, _ = torch.max(
@@ -580,19 +606,21 @@ def test_model(sample_path, urdf_path, model_path, output_path):
     f = open(os.path.join(output_path, "results.log"), 'w')
 
     for sample in sample_path:
-        pose = _load_protobuf(sample+".pb").unsqueeze(0).to(device)
+        pose, viz = _load_protobuf(sample+".pb")
+        pose = pose.unsqueeze(0).to(device)
+        viz = viz.unsqueeze(0).to(device)
         
         # Forward pass through the model to get 6D representation
-        model_output, _, _ = model(pose[:,:,2:], deterministic=True)
+        model_output, _, _ = model(pose, deterministic=True)
 
         f.write("------ "+sample+" ------\n")
         print("------ "+sample+" ------\n")
         
         for i in range(15):
-            pose_loss = loss_fn(fk, pose[:,i,2:].unsqueeze(0), model_output[:,i].unsqueeze(0), single=True)
+            pose_loss = loss_fn(fk, pose[:,i].unsqueeze(0), model_output[:,i].unsqueeze(0), single=True)
             f.write(f"- frame {i} Pose Loss: {pose_loss:.5f}\n")
         
-        pose_loss = loss_fn(fk, pose[:,:,2:], model_output)
+        pose_loss = loss_fn(fk, pose[:,:], model_output)
         f.write(f"\nPose Loss: {pose_loss:.5f}\n")
         print(f"\nPose Loss: {pose_loss:.5f}\n")
 
@@ -604,7 +632,7 @@ def test_model(sample_path, urdf_path, model_path, output_path):
                     os.remove(file_path)
         else:
             os.makedirs(path)
-        fk.animate_movement(model_output, pose.cpu(), path)
+        fk.animate_movement(model_output, viz.cpu(), path)
 
     # print("zipping...")
     # shutil.make_archive(output_path, 'zip', os.path.dirname(output_path) )
@@ -620,7 +648,7 @@ def main():
                 "/home/cedra/psl_project/5_dataset/IRIB2_48_13327_842-856_left",
                 "/home/cedra/psl_project/5_dataset/Deafinno_1036_36-50_left"]
 
-    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_100_best.pth"
+    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_7_best.pth"
 
     urdf_path="/home/cedra/psl_project/rasa/hand.urdf"
 
