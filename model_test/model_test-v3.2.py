@@ -438,7 +438,7 @@ class ForwardKinematics:
         origin = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
         for name, tf in fk_result.items():
             pos = tf.get_matrix()[:, :3, 3].detach().numpy()  # Extract translation component
-            positions[name] = (pos - origin) / self.L_ref
+            positions[name] = (pos - origin.detach().numpy()) / self.L_ref.detach().numpy()
         
         # Draw connections based on hierarchy
         for child, parent in self.link_parents.items():
