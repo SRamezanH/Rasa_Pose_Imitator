@@ -358,7 +358,7 @@ class ForwardKinematics:
             fk_result = self.robot_chain.forward_kinematics(zero_joints)
             
             # Precompute reference points
-            shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+            shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
             forearm_pos = fk_result["right_Forearm_1"].get_matrix()[:, :3, 3]
             wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
             
@@ -387,7 +387,7 @@ class ForwardKinematics:
         fk_result = self.robot_chain.forward_kinematics(joints_flat)
         
         # 4. Extract and normalize positions
-        shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+        shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
         wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
         finger1_pos = fk_result["right_Finger_1_1"].get_matrix()[:, :3, 3]
         finger4_pos = fk_result["right_Finger_4_1"].get_matrix()[:, :3, 3]
@@ -465,7 +465,7 @@ class ForwardKinematics:
         # Compute forward kinematics
         # Compute forward kinematics
         positions = {}
-        origin = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3].detach().numpy()
+        origin = fk_result["right_Arm_1"].get_matrix()[:, :3, 3].detach().numpy()
         for name, tf in fk_result.items():
             pos = tf.get_matrix()[:, :3, 3].detach().numpy()  # Extract translation component
             positions[name] = (pos - origin) / self.L_ref.detach().numpy()
@@ -556,7 +556,7 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
     
     # Stack u and v_ortho to form 6D representation
-    six_d = torch.stack([root, root+0.1*u, root+0.1*v_ortho], dim=-1)
+    six_d = torch.stack([root, root+0.2*u, root+0.2*v_ortho], dim=-1)
     return six_d
 
 def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, single=False):
@@ -648,7 +648,7 @@ def main():
                 "/home/cedra/psl_project/5_dataset/IRIB2_48_13327_842-856_left",
                 "/home/cedra/psl_project/5_dataset/Deafinno_1036_36-50_left"]
 
-    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_7_best.pth"
+    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_91_best.pth"
 
     urdf_path="/home/cedra/psl_project/rasa/hand.urdf"
 

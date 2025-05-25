@@ -414,7 +414,7 @@ class ForwardKinematics:
             fk_result = self.robot_chain.forward_kinematics(zero_joints)
             
             # Precompute reference points
-            shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+            shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
             forearm_pos = fk_result["right_Forearm_1"].get_matrix()[:, :3, 3]
             wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
             
@@ -443,7 +443,7 @@ class ForwardKinematics:
         fk_result = self.robot_chain.forward_kinematics(joints_flat)
         
         # 4. Extract and normalize positions
-        shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+        shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
         wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
         finger1_pos = fk_result["right_Finger_1_1"].get_matrix()[:, :3, 3]
         finger4_pos = fk_result["right_Finger_4_1"].get_matrix()[:, :3, 3]
@@ -566,7 +566,7 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
     
     # Stack u and v_ortho to form 6D representation
-    six_d = torch.stack([root, root+0.1*u, root+0.1*v_ortho], dim=-1)
+    six_d = torch.stack([root, root+0.2*u, root+0.2*v_ortho], dim=-1)
     return six_d
 
 def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
