@@ -225,17 +225,17 @@ class PoseVideoDataset(Dataset):
             torch.Tensor: Tensor containing video frames with shape  [15, 3, 273, 210]
         """
         # Open the video file
-        # video, _, _ = read_video(video_path ,output_format="TCHW")
-        # video_tensor = video.to(device)
-        # video_tensor = video_tensor[:15, :3, :210, :273]
-        # num_frames, ch, h, w = video_tensor.shape
-        # if num_frames < 15:
-        #     print("Low frame count" + video_path)
-        #     padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
-        #     video_tensor = torch.cat((video_tensor, padding), dim=0)
+        video, _, _ = read_video(video_path ,output_format="TCHW")
+        video_tensor = video.to(device)
+        video_tensor = video_tensor[:15, :3, :210, :273]
+        num_frames, ch, h, w = video_tensor.shape
+        if num_frames < 15:
+            print("Low frame count" + video_path)
+            padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
+            video_tensor = torch.cat((video_tensor, padding), dim=0)
 
-        #return video_tensor.permute(0,1,3,2) / 255.0
-        return torch.zeros([15, 3, 273, 210])# video_tensor / 255.0
+        return video_tensor.permute(0,1,3,2) / 255.0
+        # return torch.zeros([15, 3, 273, 210], dtype=torch.float32) 
 
     def _load_protobuf(self, pb_path):
         """
@@ -264,72 +264,105 @@ class PoseVideoDataset(Dataset):
 
             pose_tensor = torch.cat((pose_tensor, selected_landmarks), dim=0)
 
-        pose_tensor = pose_tensor.to(device)
-
         # Ensure we have exactly 15 frames
         num_frames, feature_size, dim_size = pose_tensor.shape
         if num_frames < 15:
-            print("Low frame count" + pb_path)
-            padding = torch.zeros([15 - num_frames, feature_size, dim_size ]).to(device)
+            padding = torch.zeros([15 - num_frames, feature_size, dim_size], dtype=torch.float32)
             pose_tensor = torch.cat((pose_tensor, padding), dim=0)
         elif num_frames > 15:
             pose_tensor = pose_tensor[:15, :, :]
 
+        # Convert to 6D representation (do this before moving to device)
         return batch_vectors_to_6D(pose_tensor)
 
 
 # Neural Network Model Definition
-
 class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
-        # Temporal RNN (LSTM)
+        # --- Video-to-pose transformation block: transforms each video frame into a 3x3 matrix
+        self.video_to_pose = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),  # First 2D convolution layer
+            nn.ReLU(),                                  # Activation function
+            nn.Conv2d(16, 9, kernel_size=3, padding=1),  # Output 9 channels → reshape to 3x3
+            nn.AdaptiveAvgPool2d((3, 3))                # Downsample to fixed 3x3 size
+        )
+
+        # --- Main encoder (unchanged)
         self.encoder = nn.Sequential(
-            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # (8, 15, 3, 3)
+            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # 3D convolution layer
             nn.ReLU(),
-            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1), # (16, 8, 2, 2)
+            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.Flatten()
         )
 
-        # Latent space
+        # Latent mean layer for VAE
         self.fc_mu = nn.Sequential(
             nn.Dropout(0.1),
             nn.Linear(16*8*2*2, 16),
             nn.LeakyReLU(0.1),
         )
 
+        # Latent log-variance layer for VAE
         self.fc_logvar = nn.Sequential(
             nn.Dropout(0.1),
             nn.Linear(16*8*2*2, 16),
             nn.LeakyReLU(0.1),
         )
 
-        # Decoder parameters
+        # Decoder fully connected layer
         self.fc_decode = nn.Linear(16, 16 * 8 * 2 * 2)
 
+        # Decoder block
         self.decoder = nn.Sequential(
             nn.Unflatten(1, (16, 8, 2, 2)),
-            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1),# output_padding=(1,1,1)),
+            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
         )
+
+        # Final output layer to convert flattened pose data to 6D representation
+        self.fc_output = nn.Linear(15 * 3 * 3, 15 * 6)
+
+    def forward(self, video_input, deterministic=False):
+        # video_input shape from dataset: (B, T, C, H, W) = (B, 15, 3, H, W)
+        # Need to rearrange to (B, C, T, H, W) = (B, 3, 15, H, W)
+        if video_input.shape[1] == 15 and video_input.shape[2] == 3:
+            # Permute dimensions to match expected shape: (B, T, C, H, W) -> (B, C, T, H, W)
+            video_input = video_input.permute(0, 2, 1, 3, 4)
         
-        # transform 3x3 representation to 6d representation
-        self.fc_output = nn.Sequential(
-            nn.Linear(15 * 3 * 3, 15 * 6),
-            nn.Sigmoid()
-        )
+        # Now we have shape (B, C, T, H, W) = (B, 3, 15, H, W)
+        B, C, T, H, W = video_input.shape
+        pose_matrices = []
 
-    def forward(self, input_data, deterministic=False):
-        batch_size, seq_len = input_data.shape[0], input_data.shape[1]
+        # Loop through each time step (frame)
+        for t in range(T):
+            frame = video_input[:, :, t, :, :]       # Extract frame: (B, 3, H, W)
+            out = self.video_to_pose(frame)          # Output shape: (B, 9, 3, 3)
+            
+            # Reshape the 9 channels into 3 matrices of 3x3
+            # Each set of 3 channels forms one 3x3 matrix
+            # The output of self.video_to_pose has shape (B, 9, 3, 3)
+            # We need to reshape it correctly to avoid dimension errors
+            out = out.reshape(B, 3, 3, 3, 3)  # (B, 3, 3, 3, 3) where dimensions are (batch, num_matrices, channels_per_matrix, height, width)
+            out = out.mean(dim=2)  # Average across the channels_per_matrix dimension to get (B, 3, 3, 3)
 
-        # Flatten pose input: (B, T, 3, 3) -> (B, T, 9)
-        x = input_data.permute(0, 3, 1, 2).unsqueeze(1)
+            # Average across the matrices to get a single 3x3 matrix per frame
+            pose_matrix = out.mean(dim=1)            # Shape: (B, 3, 3)
+            pose_matrices.append(pose_matrix)
+
+        # Stack the 15 pose matrices → shape: (B, 15, 3, 3)
+        pose_like_input = torch.stack(pose_matrices, dim=1)
+
+        # Reshape for encoder input: (B, 1, 15, 3, 3)
+        x = pose_like_input.unsqueeze(1)
+
+        # Encode
         h = self.encoder(x)
 
-        # Latent space
+        # Compute latent mean and log variance
         mu = self.fc_mu(h)
         logvar = torch.clamp(self.fc_logvar(h), min=-10, max=10)
 
@@ -339,14 +372,15 @@ class PoseVideoCNNRNN(nn.Module):
             std = torch.exp(0.5 * logvar)
             embedding = embedding + torch.randn_like(std) * std
 
+        # Decode
         h = self.fc_decode(embedding)
-        output = self.decoder(h)
-        output = output.squeeze(1)
-        
-        # transform to 6D representation
-        output_flat = output.view(batch_size, -1)  # (B, 135)
-        output_6d = self.fc_output(output_flat)  # (B, 90)
-        output_6d = output_6d.view(batch_size, 15, 6)  # (B, 15, 6)
+        output = self.decoder(h)                    # Shape: (B, 1, 15, 3, 3)
+        output = output.squeeze(1)                  # Shape: (B, 15, 3, 3)
+
+        # Flatten and map to 6D output representation
+        output_flat = output.view(B, -1)            # Shape: (B, 135)
+        output_6d = self.fc_output(output_flat)     # Shape: (B, 90)
+        output_6d = output_6d.view(B, 15, 6)         # Final shape: (B, 15, 6)
 
         return output_6d, mu, logvar
 
@@ -685,12 +719,12 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             model = PoseVideoCNNRNN().to(device)
             # Get shape from a sample
             sample = dataset[0]
-            #video_shape = sample["video"].shape
+            video_shape = sample["video"].shape
             pose_shape = sample["pose"].shape
             # Show model summary
             model_stats = summary(
                 model,
-                input_size=(batch_size,) + pose_shape, #input_size=(batch_size,) + video_shape,
+                input_size=(batch_size,) +video_shape, #input_size=(batch_size,) + pose_shape,
                 depth=4,
                 device=device,
                 col_names=["input_size", "output_size", "num_params", "kernel_size", "mult_adds"],
@@ -750,12 +784,12 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         lambda_vel = lambda_scheduler(epoch, warmup_start=5, warmup_end=45, final_value=30)
 
         for i, batch in enumerate(batch_pbar):
-            # video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
-            pose_data = batch["pose"]  # Shape: [batch, 15, 3, 3] (ground truth)
+            video_data = batch["video"].to(device)  # Move to the same device as the model
+            pose_data = batch["pose"].to(device)  # Move to the same device as the model
             
-            # model_output, mu, logvar = model(video_data)  # Output: [batch, 15, 26] (predicted)
+            model_output, mu, logvar = model(video_data)  # Output: [batch, 15, 26] (predicted)
             # pose data as input instead of video
-            model_output, mu, logvar = model(pose_data)  # Output: [batch, 15, 6] (predicted)
+            #model_output, mu, logvar = model(pose_data)  # Output: [batch, 15, 6] (predicted)
 
             # Compute loss
             loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
@@ -817,11 +851,11 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
         with torch.no_grad():  # No gradient computation
             for i, batch in enumerate(eval_pbar):
-                # video_data = batch["video"]
-                pose_data = batch["pose"]
+                video_data = batch["video"].to(device)
+                pose_data = batch["pose"].to(device)
 
                 # Forward pass with pose data as input instead of video
-                model_output, mu, logvar = model(pose_data)
+                model_output, mu, logvar = model(video_data)
 
                 # Compute loss
                 loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
