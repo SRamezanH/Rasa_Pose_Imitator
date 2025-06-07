@@ -199,7 +199,7 @@ def _load_protobuf(pb_path):
 
     return batch_vectors_to_6D(pose_tensor), viz_tensor
 
-def _load_video(self, video_path):
+def _load_video(video_path):
     """
     Load and process video frames using OpenCV.
 
@@ -210,68 +210,147 @@ def _load_video(self, video_path):
         torch.Tensor: Tensor containing video frames with shape  [15, 3, 273, 210]
     """
     # Open the video file
-    # video, _, _ = read_video(video_path ,output_format="TCHW")
-    # video_tensor = video.to(device)
-    # video_tensor = video_tensor[:15, :3, :210, :273]
-    # num_frames, ch, h, w = video_tensor.shape
-    # if num_frames < 15:
-    #     print("Low frame count" + video_path)
-    #     padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
-    #     video_tensor = torch.cat((video_tensor, padding), dim=0)
+    video, _, _ = read_video(video_path ,output_format="TCHW")
+    video_tensor = video.to(device)
+    video_tensor = video_tensor[:15, :3, :210, :273]
+    num_frames, ch, h, w = video_tensor.shape
+    if num_frames < 15:
+        print("Low frame count" + video_path)
+        padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
+        video_tensor = torch.cat((video_tensor, padding), dim=0)
 
-    #return video_tensor.permute(0,1,3,2) / 255.0
-    return torch.zeros([15, 3, 273, 210])# video_tensor / 255.0
+    return video_tensor.permute(0,1,3,2) / 255.0
 
 class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
-        # Temporal RNN (LSTM)
+        # --- Video-to-pose transformation block: transforms each video frame into a 3x3 matrix
+        self.backbone = nn.Sequential(
+            # In: (B, 3, 15, 273, 210)
+            # └─ First 3D conv to start extracting low‐level spatial+temporal features
+            nn.Conv3d(
+                in_channels=3,
+                out_channels=32,
+                kernel_size=(3, 5, 5),
+                stride=(1, 2, 2),
+                padding=(1, 2, 2),
+            ),  # → (B, 32, 15, 137, 105)
+            nn.ReLU(inplace=True),
+
+            # Second 3D conv
+            nn.Conv3d(
+                in_channels=32,
+                out_channels=64,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=(1, 1, 1),
+            ),  # → (B, 64, 15, 69, 53)
+            nn.ReLU(inplace=True),
+
+            # Third 3D conv
+            nn.Conv3d(
+                in_channels=64,
+                out_channels=128,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=(1, 1, 1),
+            ),  # → (B, 128, 15, 35, 27)
+            nn.ReLU(inplace=True),
+
+            # Fourth 3D conv
+            nn.Conv3d(
+                in_channels=128,
+                out_channels=64,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=(1, 1, 1),
+            ),  # → (B, 64, 15, 18, 14)
+            nn.ReLU(inplace=True),
+
+            # Fifth (final) 3D conv → 1 output channel per frame
+            nn.Conv3d(
+                in_channels=64,
+                out_channels=1,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=(1, 1, 1),
+            ),  # → (B, 1, 15, 9, 7)
+            nn.ReLU(inplace=True),
+        )
+
+        # Adaptive pooling to force spatial dims to (3 × 3), keeping T=15 fixed
+        # Input: (B, 1, 15, 9, 7)  ─┐
+        #                            → AdaptiveAvgPool3d((15, 3, 3))
+        #                       ──> (B, 1, 15, 3, 3)
+        self.adaptive_pool = nn.AdaptiveAvgPool3d((15, 3, 3))
+
+        # --- Main encoder (unchanged)
         self.encoder = nn.Sequential(
-            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # (8, 15, 3, 3)
+            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # 3D convolution layer
             nn.ReLU(),
-            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1), # (16, 8, 2, 2)
+            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.Flatten()
         )
 
-        # Latent space
+        # Latent mean layer for VAE
         self.fc_mu = nn.Sequential(
             nn.Dropout(0.1),
             nn.Linear(16*8*2*2, 16),
             nn.LeakyReLU(0.1),
         )
 
+        # Latent log-variance layer for VAE
         self.fc_logvar = nn.Sequential(
             nn.Dropout(0.1),
             nn.Linear(16*8*2*2, 16),
             nn.LeakyReLU(0.1),
         )
 
-        # Decoder parameters
+        # Decoder fully connected layer
         self.fc_decode = nn.Linear(16, 16 * 8 * 2 * 2)
 
+        # Decoder block
         self.decoder = nn.Sequential(
             nn.Unflatten(1, (16, 8, 2, 2)),
-            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1),# output_padding=(1,1,1)),
+            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
         )
-        
-        # transform 3x3 representation to 6d representation
+
+        # Final output layer to convert flattened pose data to 6D representation
         self.fc_output = nn.Sequential(
             nn.Linear(15 * 3 * 3, 15 * 6),
             nn.Sigmoid()
         )
 
-    def forward(self, input_data, deterministic=False):
-        batch_size, seq_len = input_data.shape[0], input_data.shape[1]
+    def forward(self, video_input, deterministic=False):
+        # video_input shape from dataset: (B, T, C, H, W) = (B, 15, 3, H, W)
+        # Need to rearrange to (B, C, T, H, W) = (B, 3, 15, H, W)
+        # Permute dimensions to match expected shape: (B, T, C, H, W) -> (B, C, T, H, W)
+        video_input = video_input.permute(0, 2, 1, 3, 4)
+        
+        # Now we have shape (B, C, T, H, W) = (B, 3, 15, H, W)
+        B, C, T, H, W = video_input.shape
+        x = self.backbone(video_input)  
+        # Now x has shape (B, 1, 15, 9, 7)
 
-        # Flatten pose input: (B, T, 3, 3) -> (B, T, 9)
-        x = input_data.permute(0, 3, 1, 2).unsqueeze(1)
+        # Pool spatially down to (3×3), but keep T=15
+        x = self.adaptive_pool(x)  
+        # x now has shape (B, 1, 15, 3, 3)
+
+        # Collapse the channel‐dimension (it’s just 1 now)
+        pose_like_input = x.squeeze(1)  
+        # Final shape: (B, 15, 3, 3)
+
+        # Reshape for encoder input: (B, 1, 15, 3, 3)
+        x = pose_like_input.unsqueeze(1)
+
+        # Encode
         h = self.encoder(x)
 
-        # Latent space
+        # Compute latent mean and log variance
         mu = self.fc_mu(h)
         logvar = torch.clamp(self.fc_logvar(h), min=-10, max=10)
 
@@ -281,14 +360,15 @@ class PoseVideoCNNRNN(nn.Module):
             std = torch.exp(0.5 * logvar)
             embedding = embedding + torch.randn_like(std) * std
 
+        # Decode
         h = self.fc_decode(embedding)
-        output = self.decoder(h)
-        output = output.squeeze(1)
-        
-        # transform to 6D representation
-        output_flat = output.view(batch_size, -1)  # (B, 135)
-        output_6d = self.fc_output(output_flat)  # (B, 90)
-        output_6d = output_6d.view(batch_size, 15, 6)  # (B, 15, 6)
+        output = self.decoder(h)                    # Shape: (B, 1, 15, 3, 3)
+        output = output.squeeze(1)                  # Shape: (B, 15, 3, 3)
+
+        # Flatten and map to 6D output representation
+        output_flat = output.view(B, -1)            # Shape: (B, 135)
+        output_6d = self.fc_output(output_flat)     # Shape: (B, 90)
+        output_6d = output_6d.view(B, 15, 6)         # Final shape: (B, 15, 6)
 
         return output_6d, mu, logvar
 
@@ -607,11 +687,12 @@ def test_model(sample_path, urdf_path, model_path, output_path):
 
     for sample in sample_path:
         pose, viz = _load_protobuf(sample+".pb")
+        video = _load_video(sample+".mp4").unsqueeze(0).to(device)
         pose = pose.unsqueeze(0).to(device)
         viz = viz.unsqueeze(0).to(device)
         
         # Forward pass through the model to get 6D representation
-        model_output, _, _ = model(pose, deterministic=True)
+        model_output, _, _ = model(video, deterministic=True)
 
         f.write("------ "+sample+" ------\n")
         print("------ "+sample+" ------\n")
@@ -639,6 +720,18 @@ def test_model(sample_path, urdf_path, model_path, output_path):
 
 def main():
     """Main function to parse arguments and run the training or testing process"""
+    DEFAULT_NAME = "1_best"
+    parser = argparse.ArgumentParser(
+        description="Model Tester"
+    )
+    parser.add_argument(
+        "--name", type=str, help="Saved Model Name: 34_best"
+    )
+    args = parser.parse_args()
+    name = args.name if args.name is not None else DEFAULT_NAME
+
+    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_"+name+".pth"
+
     
     samples = ["/home/cedra/psl_project/5_dataset/IRIB2_105_23513_117-131_right",
                 "/home/cedra/psl_project/5_dataset/IRIB2_44_7637_196-210_right",
@@ -647,8 +740,6 @@ def main():
                 "/home/cedra/psl_project/5_dataset/IRIB2_117_22098_832-846_right",
                 "/home/cedra/psl_project/5_dataset/IRIB2_48_13327_842-856_left",
                 "/home/cedra/psl_project/5_dataset/Deafinno_1036_36-50_left"]
-
-    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_91_best.pth"
 
     urdf_path="/home/cedra/psl_project/rasa/hand.urdf"
 

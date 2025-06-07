@@ -282,12 +282,64 @@ class PoseVideoCNNRNN(nn.Module):
         super(PoseVideoCNNRNN, self).__init__()
 
         # --- Video-to-pose transformation block: transforms each video frame into a 3x3 matrix
-        self.video_to_pose = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),  # First 2D convolution layer
-            nn.ReLU(),                                  # Activation function
-            nn.Conv2d(16, 9, kernel_size=3, padding=1),  # Output 9 channels → reshape to 3x3
-            nn.AdaptiveAvgPool2d((3, 3))                # Downsample to fixed 3x3 size
+        self.backbone = nn.Sequential(
+            # In: (B, 3, 15, 273, 210)
+            # └─ First 3D conv to start extracting low‐level spatial+temporal features
+            nn.Conv3d(
+                in_channels=3,
+                out_channels=32,
+                kernel_size=(3, 5, 5),
+                stride=(1, 2, 2),
+                padding=(1, 2, 2),
+            ),  # → (B, 32, 15, 137, 105)
+            nn.ReLU(inplace=True),
+
+            # Second 3D conv
+            nn.Conv3d(
+                in_channels=32,
+                out_channels=64,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=(1, 1, 1),
+            ),  # → (B, 64, 15, 69, 53)
+            nn.ReLU(inplace=True),
+
+            # Third 3D conv
+            nn.Conv3d(
+                in_channels=64,
+                out_channels=128,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=(1, 1, 1),
+            ),  # → (B, 128, 15, 35, 27)
+            nn.ReLU(inplace=True),
+
+            # Fourth 3D conv
+            nn.Conv3d(
+                in_channels=128,
+                out_channels=64,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=(1, 1, 1),
+            ),  # → (B, 64, 15, 18, 14)
+            nn.ReLU(inplace=True),
+
+            # Fifth (final) 3D conv → 1 output channel per frame
+            nn.Conv3d(
+                in_channels=64,
+                out_channels=1,
+                kernel_size=(3, 3, 3),
+                stride=(1, 2, 2),
+                padding=(1, 1, 1),
+            ),  # → (B, 1, 15, 9, 7)
+            nn.ReLU(inplace=True),
         )
+
+        # Adaptive pooling to force spatial dims to (3 × 3), keeping T=15 fixed
+        # Input: (B, 1, 15, 9, 7)  ─┐
+        #                            → AdaptiveAvgPool3d((15, 3, 3))
+        #                       ──> (B, 1, 15, 3, 3)
+        self.adaptive_pool = nn.AdaptiveAvgPool3d((15, 3, 3))
 
         # --- Main encoder (unchanged)
         self.encoder = nn.Sequential(
@@ -324,37 +376,29 @@ class PoseVideoCNNRNN(nn.Module):
         )
 
         # Final output layer to convert flattened pose data to 6D representation
-        self.fc_output = nn.Linear(15 * 3 * 3, 15 * 6)
+        self.fc_output = nn.Sequential(
+            nn.Linear(15 * 3 * 3, 15 * 6),
+            nn.Sigmoid()
+        )
 
     def forward(self, video_input, deterministic=False):
         # video_input shape from dataset: (B, T, C, H, W) = (B, 15, 3, H, W)
         # Need to rearrange to (B, C, T, H, W) = (B, 3, 15, H, W)
-        if video_input.shape[1] == 15 and video_input.shape[2] == 3:
-            # Permute dimensions to match expected shape: (B, T, C, H, W) -> (B, C, T, H, W)
-            video_input = video_input.permute(0, 2, 1, 3, 4)
+        # Permute dimensions to match expected shape: (B, T, C, H, W) -> (B, C, T, H, W)
+        video_input = video_input.permute(0, 2, 1, 3, 4)
         
         # Now we have shape (B, C, T, H, W) = (B, 3, 15, H, W)
         B, C, T, H, W = video_input.shape
-        pose_matrices = []
+        x = self.backbone(video_input)  
+        # Now x has shape (B, 1, 15, 9, 7)
 
-        # Loop through each time step (frame)
-        for t in range(T):
-            frame = video_input[:, :, t, :, :]       # Extract frame: (B, 3, H, W)
-            out = self.video_to_pose(frame)          # Output shape: (B, 9, 3, 3)
-            
-            # Reshape the 9 channels into 3 matrices of 3x3
-            # Each set of 3 channels forms one 3x3 matrix
-            # The output of self.video_to_pose has shape (B, 9, 3, 3)
-            # We need to reshape it correctly to avoid dimension errors
-            out = out.reshape(B, 3, 3, 3, 3)  # (B, 3, 3, 3, 3) where dimensions are (batch, num_matrices, channels_per_matrix, height, width)
-            out = out.mean(dim=2)  # Average across the channels_per_matrix dimension to get (B, 3, 3, 3)
+        # Pool spatially down to (3×3), but keep T=15
+        x = self.adaptive_pool(x)  
+        # x now has shape (B, 1, 15, 3, 3)
 
-            # Average across the matrices to get a single 3x3 matrix per frame
-            pose_matrix = out.mean(dim=1)            # Shape: (B, 3, 3)
-            pose_matrices.append(pose_matrix)
-
-        # Stack the 15 pose matrices → shape: (B, 15, 3, 3)
-        pose_like_input = torch.stack(pose_matrices, dim=1)
+        # Collapse the channel‐dimension (it’s just 1 now)
+        pose_like_input = x.squeeze(1)  
+        # Final shape: (B, 15, 3, 3)
 
         # Reshape for encoder input: (B, 1, 15, 3, 3)
         x = pose_like_input.unsqueeze(1)
