@@ -207,7 +207,7 @@ class PoseVideoDataset(Dataset):
         # Load pose data from protobuf
         pose_data = self._load_protobuf(pb_path)
 
-        sample = {"video": video_data, "pose": pose_data}
+        sample = {"name": video_path,"video": video_data, "pose": pose_data}
 
         if self.transform:
             sample = self.transform(sample)
@@ -282,71 +282,107 @@ class PoseVideoCNNRNN(nn.Module):
         super(PoseVideoCNNRNN, self).__init__()
 
         # --- Video-to-pose transformation block: transforms each video frame into a 3x3 matrix
-        self.backbone = nn.Sequential(
-            # In: (B, 3, 15, 273, 210)
-            # └─ First 3D conv to start extracting low‐level spatial+temporal features
-            nn.Conv3d(
-                in_channels=3,
-                out_channels=32,
-                kernel_size=(3, 5, 5),
-                stride=(1, 2, 2),
-                padding=(1, 2, 2),
-            ),  # → (B, 32, 15, 137, 105)
+        # self.backbone = nn.Sequential(
+        #     # In: (B, 3, 15, 273, 210)
+        #     # └─ First 3D conv to start extracting low‐level spatial+temporal features
+        #     nn.Conv3d(
+        #         in_channels=3,
+        #         out_channels=32,
+        #         kernel_size=(3, 5, 5),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 2, 2),
+        #     ),  # → (B, 32, 15, 137, 105)
+        #     nn.ReLU(inplace=True),
+
+        #     # Second 3D conv
+        #     nn.Conv3d(
+        #         in_channels=32,
+        #         out_channels=64,
+        #         kernel_size=(3, 3, 3),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 1, 1),
+        #     ),  # → (B, 64, 15, 69, 53)
+        #     nn.ReLU(inplace=True),
+
+        #     # Third 3D conv
+        #     nn.Conv3d(
+        #         in_channels=64,
+        #         out_channels=128,
+        #         kernel_size=(3, 3, 3),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 1, 1),
+        #     ),  # → (B, 128, 15, 35, 27)
+        #     nn.ReLU(inplace=True),
+
+        #     # Fourth 3D conv
+        #     nn.Conv3d(
+        #         in_channels=128,
+        #         out_channels=64,
+        #         kernel_size=(3, 3, 3),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 1, 1),
+        #     ),  # → (B, 64, 15, 18, 14)
+        #     nn.ReLU(inplace=True),
+
+        #     # Fifth (final) 3D conv → 1 output channel per frame
+        #     nn.Conv3d(
+        #         in_channels=64,
+        #         out_channels=1,
+        #         kernel_size=(3, 3, 3),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 1, 1),
+        #     ),  # → (B, 1, 15, 9, 7)
+        #     nn.ReLU(inplace=True),
+        # )
+
+        # # Adaptive pooling to force spatial dims to (3 × 3), keeping T=15 fixed
+        # # Input: (B, 1, 15, 9, 7)  ─┐
+        # #                            → AdaptiveAvgPool3d((15, 3, 3))
+        # #                       ──> (B, 1, 15, 3, 3)
+        # self.adaptive_pool = nn.AdaptiveAvgPool3d((15, 3, 3))
+
+        # # --- Main encoder (unchanged)
+        # self.encoder = nn.Sequential(
+        #     nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # 3D convolution layer
+        #     nn.ReLU(),
+        #     nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),
+        #     nn.ReLU(),
+        #     nn.Flatten()
+        # )
+
+        # --- Combined Video-to-Latent transformation ---
+        self.feature_extractor = nn.Sequential(
+            # Original backbone with increased output channels
+            nn.Conv3d(3, 32, kernel_size=(3,5,5), stride=(1,2,2), padding=(1,2,2)),
             nn.ReLU(inplace=True),
-
-            # Second 3D conv
-            nn.Conv3d(
-                in_channels=32,
-                out_channels=64,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),  # → (B, 64, 15, 69, 53)
+            nn.Conv3d(32, 64, kernel_size=(3,3,3), stride=(1,2,2), padding=(1,1,1)),
             nn.ReLU(inplace=True),
-
-            # Third 3D conv
-            nn.Conv3d(
-                in_channels=64,
-                out_channels=128,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),  # → (B, 128, 15, 35, 27)
+            nn.Conv3d(64, 128, kernel_size=(3,3,3), stride=(1,2,2), padding=(1,1,1)),
             nn.ReLU(inplace=True),
-
-            # Fourth 3D conv
-            nn.Conv3d(
-                in_channels=128,
-                out_channels=64,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),  # → (B, 64, 15, 18, 14)
+            nn.Conv3d(128, 64, kernel_size=(3,3,3), stride=(1,2,2), padding=(1,1,1)),
             nn.ReLU(inplace=True),
-
-            # Fifth (final) 3D conv → 1 output channel per frame
-            nn.Conv3d(
-                in_channels=64,
-                out_channels=1,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),  # → (B, 1, 15, 9, 7)
+            
+            # Increased output channels for better bottleneck representation
+            nn.Conv3d(64, 8, kernel_size=(3,3,3), stride=(1,2,2), padding=(1,1,1)),
             nn.ReLU(inplace=True),
-        )
-
-        # Adaptive pooling to force spatial dims to (3 × 3), keeping T=15 fixed
-        # Input: (B, 1, 15, 9, 7)  ─┐
-        #                            → AdaptiveAvgPool3d((15, 3, 3))
-        #                       ──> (B, 1, 15, 3, 3)
-        self.adaptive_pool = nn.AdaptiveAvgPool3d((15, 3, 3))
-
-        # --- Main encoder (unchanged)
-        self.encoder = nn.Sequential(
-            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # 3D convolution layer
-            nn.ReLU(),
-            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
+            
+            # Spatial compression
+            nn.AdaptiveAvgPool3d((15, 3, 3)),  # (B, 8, 15, 3, 3)
+            
+            # --- Enhanced Encoder ---
+            # Transition layer (expands channel dimension)
+            nn.Conv3d(8, 16, kernel_size=1, stride=1),  # 1x1 convolution
+            nn.LeakyReLU(0.1, inplace=True),
+            
+            # Original encoder layers with increased capacity
+            nn.Conv3d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv3d(32, 32, kernel_size=3, stride=2, padding=1),  # Downsample
+            nn.LeakyReLU(0.1, inplace=True),
+            
+            # Channel reduction to match original dimensions
+            nn.Conv3d(32, 16, kernel_size=1, stride=1),  # 1x1 convolution
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Flatten()
         )
 
@@ -385,26 +421,31 @@ class PoseVideoCNNRNN(nn.Module):
         # video_input shape from dataset: (B, T, C, H, W) = (B, 15, 3, H, W)
         # Need to rearrange to (B, C, T, H, W) = (B, 3, 15, H, W)
         # Permute dimensions to match expected shape: (B, T, C, H, W) -> (B, C, T, H, W)
-        video_input = video_input.permute(0, 2, 1, 3, 4)
+        # video_input = video_input.permute(0, 2, 1, 3, 4)
         
-        # Now we have shape (B, C, T, H, W) = (B, 3, 15, H, W)
+        # # Now we have shape (B, C, T, H, W) = (B, 3, 15, H, W)
         B, C, T, H, W = video_input.shape
-        x = self.backbone(video_input)  
-        # Now x has shape (B, 1, 15, 9, 7)
+        # x = self.backbone(video_input)  
+        # # Now x has shape (B, 1, 15, 9, 7)
 
-        # Pool spatially down to (3×3), but keep T=15
-        x = self.adaptive_pool(x)  
-        # x now has shape (B, 1, 15, 3, 3)
+        # # Pool spatially down to (3×3), but keep T=15
+        # x = self.adaptive_pool(x)  
+        # # x now has shape (B, 1, 15, 3, 3)
 
-        # Collapse the channel‐dimension (it’s just 1 now)
-        pose_like_input = x.squeeze(1)  
-        # Final shape: (B, 15, 3, 3)
+        # # Collapse the channel‐dimension (it’s just 1 now)
+        # pose_like_input = x.squeeze(1)  
+        # # Final shape: (B, 15, 3, 3)
 
-        # Reshape for encoder input: (B, 1, 15, 3, 3)
-        x = pose_like_input.unsqueeze(1)
+        # # Reshape for encoder input: (B, 1, 15, 3, 3)
+        # x = pose_like_input.unsqueeze(1)
 
-        # Encode
-        h = self.encoder(x)
+        # # Encode
+        # h = self.encoder(x)
+
+        x = video_input.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+        
+        # Feature extraction through combined backbone+encoder
+        h = self.feature_extractor(x)
 
         # Compute latent mean and log variance
         mu = self.fc_mu(h)
@@ -725,7 +766,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
     # Create dataset with validation to filter out corrupted videos
     dataset = PoseVideoDataset(root_dir=data_dir, validate_files=False)
-    # test_dataset = PoseVideoDataset(root_dir=test_dir, validate_files=False)
+    test_dataset = PoseVideoDataset(root_dir=test_dir, validate_files=False)
     
     if len(dataset) == 0:
         print("No valid videos found in the dataset. Please check your data files.")
@@ -738,23 +779,23 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
     print(f"Dataset loaded: {len(dataset)} valid samples")
 
     # Split dataset into train and test sets
-    train_size = int(0.8 * len(dataset))
-    eval_size = int(0.2 * len(dataset))
-    test_size = 0 # int(0.15 * len(dataset))
+    train_size = int(0.9 * len(dataset))
+    eval_size = int(0.1 * len(dataset))
+    test_size = 0 #int(0.01 * len(dataset))
     e = len(dataset) - train_size - eval_size - test_size
-    train_dataset, eval_dataset, test_dataset, _ = random_split(dataset, [train_size, eval_size, test_size, e])
+    train_dataset, eval_dataset, _, _ = random_split(dataset, [train_size, eval_size, test_size, e])
 
-    for i in random.sample(train_dataset.indices, 2):
-        print(dataset.video_files[i])
-    for i in random.sample(eval_dataset.indices, 2):
-        print(dataset.video_files[i])
+    # for i in random.sample(train_dataset.indices, 2):
+    #     print(dataset.video_files[i])
+    # for i in random.sample(eval_dataset.indices, 2):
+    #     print(dataset.video_files[i])
     # for i in random.sample(test_dataset.indices, 2):
     #     print(dataset.video_files[i])
 
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
-    # test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     print(f"Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}, Test size: {len(test_dataset)}")
 
@@ -966,50 +1007,71 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         
     print(f"\nTraining completed in {num_epochs} epochs")
 
-    # # Evaluation on test data
-    # print("\nEvaluating model on test data...")
-    # model.eval()  # Set model to evaluation mode
-    # test_loss = 0
-    # test_pose_loss = 0
-    # test_R_loss = 0
-    # test_kl_loss = 0
-    # test_vel_loss = 0
-    # test_dir_loss = 0
-    
-    # # Progress bar for test batches
-    # test_pbar = tqdm(
-    #     test_loader, 
-    #     desc="Testing", 
-    #     total=len(test_loader)
-    # )
+    # Evaluation on test data
+    print("\nEvaluating model on test data...")
+    test_loss = 0
+    test_pose_loss = 0
+    test_R_loss = 0
+    test_kl_loss = 0
+    test_vel_loss = 0
+    test_dir_loss = 0
 
-    # with torch.no_grad():  # No gradient computation
-    #     for i, batch in enumerate(test_pbar):
-    #         # video_data = batch["video"]
-    #         pose_data = batch["pose"]
+    # Progress bar for test batches
+    test_pbar = tqdm(
+        test_loader, 
+        desc="Testing", 
+        total=len(test_loader)
+    )
 
-    #         # Forward pass with pose data as input instead of video
-    #         model_output, mu, logvar = model(pose_data)
+    with torch.no_grad():  # No gradient computation
+        f = open("test.log", 'w')
+        for i, batch in enumerate(test_pbar):
+            video_data = batch["video"].to(device)
+            pose_data = batch["pose"].to(device)
+
+            # Forward pass with pose data as input instead of video
+            model_output, mu, logvar = model(video_data)
+
+            # Compute loss
+            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
             
-    #         # Compute Loss
-    #         loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss_val = loss
+            pose_loss_val = pose_loss
+            R_loss_val = R_loss
+            kl_loss_val = kl_loss
+            vel_loss_val = vel_loss
+            dir_loss_val = dir_loss
 
-    #         test_loss += loss
-    #         test_pose_loss += pose_loss
-    #         test_R_loss += R_loss
-    #         test_kl_loss += kl_loss
-    #         test_vel_loss += vel_loss
-    #         test_dir_loss += dir_loss
+            f.write(str(batch["name"][0])+","+str(loss_val.item())+","+str(pose_loss_val.item())+","+str(kl_loss_val.item())+"\n")
 
-    # test_loss /= len(test_loader)
-    # test_pose_loss /= len(test_loader)
-    # test_R_loss /= len(test_loader)
-    # test_kl_loss /= len(test_loader)
-    # test_vel_loss /= len(test_loader)
-    # test_dir_loss /= len(test_loader)
+            test_loss += loss_val
+            test_pose_loss += pose_loss_val
+            test_R_loss += R_loss_val
+            test_kl_loss += kl_loss_val
+            test_vel_loss += vel_loss_val
+            test_dir_loss += dir_loss_val
 
-    # print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, R Loss: {test_R_loss:.5f}, "
-    #       f"KL Loss: {test_kl_loss:.5f}, Vel Loss: {test_vel_loss:.5f}, dir Loss: {test_dir_loss:.5f}")
+            # Update progress bar
+            test_pbar.set_postfix({
+                'loss': f'{loss_val:.2f}', 
+                'pose_loss': f'{pose_loss_val:.2f}', 
+                # 'R_loss': f'{R_loss_val:.2f}', 
+                'kl_loss': f'{kl_loss_val:.2f}', 
+                # 'vel_loss': f'{vel_loss_val:.2f}', 
+                # 'dir_loss': f'{dir_loss_val:.2f}'
+            })
+    test_loss /= len(test_loader)
+    test_pose_loss /= len(test_loader)
+    test_R_loss /= len(test_loader)
+    test_kl_loss /= len(test_loader)
+    test_vel_loss /= len(test_loader)
+    test_dir_loss /= len(test_loader)
+
+    scheduler.step(test_loss)
+
+    # Print epoch summary
+    print(f"Test Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f},"# R Loss: {test_R_loss:.5f}, "
+            f"KL Loss: {test_kl_loss:.5f}")#, Vel Loss: {test_vel_loss:.5f}, dir Loss: {test_dir_loss:.5f}")
 
 def main():
     """Main function to parse arguments and run the training or testing process"""
