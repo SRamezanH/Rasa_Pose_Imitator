@@ -221,76 +221,113 @@ def _load_video(video_path):
 
     return video_tensor.permute(0,1,3,2) / 255.0
 
+# Neural Network Model Definition
 class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
         # --- Video-to-pose transformation block: transforms each video frame into a 3x3 matrix
-        self.backbone = nn.Sequential(
-            # In: (B, 3, 15, 273, 210)
-            # └─ First 3D conv to start extracting low‐level spatial+temporal features
-            nn.Conv3d(
-                in_channels=3,
-                out_channels=32,
-                kernel_size=(3, 5, 5),
-                stride=(1, 2, 2),
-                padding=(1, 2, 2),
-            ),  # → (B, 32, 15, 137, 105)
+        # self.backbone = nn.Sequential(
+        #     # In: (B, 3, 15, 273, 210)
+        #     # └─ First 3D conv to start extracting low‐level spatial+temporal features
+        #     nn.Conv3d(
+        #         in_channels=3,
+        #         out_channels=32,
+        #         kernel_size=(3, 5, 5),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 2, 2),
+        #     ),  # → (B, 32, 15, 137, 105)
+        #     nn.ReLU(inplace=True),
+
+        #     # Second 3D conv
+        #     nn.Conv3d(
+        #         in_channels=32,
+        #         out_channels=64,
+        #         kernel_size=(3, 3, 3),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 1, 1),
+        #     ),  # → (B, 64, 15, 69, 53)
+        #     nn.ReLU(inplace=True),
+
+        #     # Third 3D conv
+        #     nn.Conv3d(
+        #         in_channels=64,
+        #         out_channels=128,
+        #         kernel_size=(3, 3, 3),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 1, 1),
+        #     ),  # → (B, 128, 15, 35, 27)
+        #     nn.ReLU(inplace=True),
+
+        #     # Fourth 3D conv
+        #     nn.Conv3d(
+        #         in_channels=128,
+        #         out_channels=64,
+        #         kernel_size=(3, 3, 3),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 1, 1),
+        #     ),  # → (B, 64, 15, 18, 14)
+        #     nn.ReLU(inplace=True),
+
+        #     # Fifth (final) 3D conv → 1 output channel per frame
+        #     nn.Conv3d(
+        #         in_channels=64,
+        #         out_channels=1,
+        #         kernel_size=(3, 3, 3),
+        #         stride=(1, 2, 2),
+        #         padding=(1, 1, 1),
+        #     ),  # → (B, 1, 15, 9, 7)
+        #     nn.ReLU(inplace=True),
+        # )
+
+        # # Adaptive pooling to force spatial dims to (3 × 3), keeping T=15 fixed
+        # # Input: (B, 1, 15, 9, 7)  ─┐
+        # #                            → AdaptiveAvgPool3d((15, 3, 3))
+        # #                       ──> (B, 1, 15, 3, 3)
+        # self.adaptive_pool = nn.AdaptiveAvgPool3d((15, 3, 3))
+
+        # # --- Main encoder (unchanged)
+        # self.encoder = nn.Sequential(
+        #     nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # 3D convolution layer
+        #     nn.ReLU(),
+        #     nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),
+        #     nn.ReLU(),
+        #     nn.Flatten()
+        # )
+
+        # --- Combined Video-to-Latent transformation ---
+        self.feature_extractor = nn.Sequential(
+            # Original backbone with increased output channels
+            nn.Conv3d(3, 32, kernel_size=(3,5,5), stride=(1,2,2), padding=(1,2,2)),
             nn.ReLU(inplace=True),
-
-            # Second 3D conv
-            nn.Conv3d(
-                in_channels=32,
-                out_channels=64,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),  # → (B, 64, 15, 69, 53)
+            nn.Conv3d(32, 64, kernel_size=(3,3,3), stride=(1,2,2), padding=(1,1,1)),
             nn.ReLU(inplace=True),
-
-            # Third 3D conv
-            nn.Conv3d(
-                in_channels=64,
-                out_channels=128,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),  # → (B, 128, 15, 35, 27)
+            nn.Conv3d(64, 128, kernel_size=(3,3,3), stride=(1,2,2), padding=(1,1,1)),
             nn.ReLU(inplace=True),
-
-            # Fourth 3D conv
-            nn.Conv3d(
-                in_channels=128,
-                out_channels=64,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),  # → (B, 64, 15, 18, 14)
+            nn.Conv3d(128, 64, kernel_size=(3,3,3), stride=(1,2,2), padding=(1,1,1)),
             nn.ReLU(inplace=True),
-
-            # Fifth (final) 3D conv → 1 output channel per frame
-            nn.Conv3d(
-                in_channels=64,
-                out_channels=1,
-                kernel_size=(3, 3, 3),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),  # → (B, 1, 15, 9, 7)
+            
+            # Increased output channels for better bottleneck representation
+            nn.Conv3d(64, 8, kernel_size=(3,3,3), stride=(1,2,2), padding=(1,1,1)),
             nn.ReLU(inplace=True),
-        )
-
-        # Adaptive pooling to force spatial dims to (3 × 3), keeping T=15 fixed
-        # Input: (B, 1, 15, 9, 7)  ─┐
-        #                            → AdaptiveAvgPool3d((15, 3, 3))
-        #                       ──> (B, 1, 15, 3, 3)
-        self.adaptive_pool = nn.AdaptiveAvgPool3d((15, 3, 3))
-
-        # --- Main encoder (unchanged)
-        self.encoder = nn.Sequential(
-            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # 3D convolution layer
-            nn.ReLU(),
-            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
+            
+            # Spatial compression
+            nn.AdaptiveAvgPool3d((15, 3, 3)),  # (B, 8, 15, 3, 3)
+            
+            # --- Enhanced Encoder ---
+            # Transition layer (expands channel dimension)
+            nn.Conv3d(8, 16, kernel_size=1, stride=1),  # 1x1 convolution
+            nn.LeakyReLU(0.1, inplace=True),
+            
+            # Original encoder layers with increased capacity
+            nn.Conv3d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv3d(32, 32, kernel_size=3, stride=2, padding=1),  # Downsample
+            nn.LeakyReLU(0.1, inplace=True),
+            
+            # Channel reduction to match original dimensions
+            nn.Conv3d(32, 16, kernel_size=1, stride=1),  # 1x1 convolution
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Flatten()
         )
 
@@ -329,26 +366,31 @@ class PoseVideoCNNRNN(nn.Module):
         # video_input shape from dataset: (B, T, C, H, W) = (B, 15, 3, H, W)
         # Need to rearrange to (B, C, T, H, W) = (B, 3, 15, H, W)
         # Permute dimensions to match expected shape: (B, T, C, H, W) -> (B, C, T, H, W)
-        video_input = video_input.permute(0, 2, 1, 3, 4)
+        # video_input = video_input.permute(0, 2, 1, 3, 4)
         
-        # Now we have shape (B, C, T, H, W) = (B, 3, 15, H, W)
+        # # Now we have shape (B, C, T, H, W) = (B, 3, 15, H, W)
         B, C, T, H, W = video_input.shape
-        x = self.backbone(video_input)  
-        # Now x has shape (B, 1, 15, 9, 7)
+        # x = self.backbone(video_input)  
+        # # Now x has shape (B, 1, 15, 9, 7)
 
-        # Pool spatially down to (3×3), but keep T=15
-        x = self.adaptive_pool(x)  
-        # x now has shape (B, 1, 15, 3, 3)
+        # # Pool spatially down to (3×3), but keep T=15
+        # x = self.adaptive_pool(x)  
+        # # x now has shape (B, 1, 15, 3, 3)
 
-        # Collapse the channel‐dimension (it’s just 1 now)
-        pose_like_input = x.squeeze(1)  
-        # Final shape: (B, 15, 3, 3)
+        # # Collapse the channel‐dimension (it’s just 1 now)
+        # pose_like_input = x.squeeze(1)  
+        # # Final shape: (B, 15, 3, 3)
 
-        # Reshape for encoder input: (B, 1, 15, 3, 3)
-        x = pose_like_input.unsqueeze(1)
+        # # Reshape for encoder input: (B, 1, 15, 3, 3)
+        # x = pose_like_input.unsqueeze(1)
 
-        # Encode
-        h = self.encoder(x)
+        # # Encode
+        # h = self.encoder(x)
+
+        x = video_input.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+        
+        # Feature extraction through combined backbone+encoder
+        h = self.feature_extractor(x)
 
         # Compute latent mean and log variance
         mu = self.fc_mu(h)
