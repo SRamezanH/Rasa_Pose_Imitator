@@ -1,5 +1,7 @@
 # Ignore directories
+mini_dataset/
 5_dataset/
+clips/
 rasa/
 model_test/fig/
 model_test/fig_4/
@@ -15,6 +17,7 @@ meshes/
 *.zip
 *.ps1
 *.urdf
+*.tar.xz
 
 # Standard ignores (recommended)
 *.pyc
