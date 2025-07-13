@@ -907,6 +907,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
     )
 
     with torch.no_grad():  # No gradient computation
+        f = open("test.log", 'w')
         for i, batch in enumerate(test_pbar):
             # video_data = batch["video"]
             pose_data = batch["pose"]
@@ -923,6 +924,8 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             kl_loss_val = kl_loss
             vel_loss_val = vel_loss
             dir_loss_val = dir_loss
+
+            f.write(str(batch["name"][0])+","+str(loss_val.item())+","+str(pose_loss_val.item())+","+str(kl_loss_val.item())+"\n")
 
             test_loss += loss_val
             test_pose_loss += pose_loss_val
