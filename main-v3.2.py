@@ -647,7 +647,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
     # Create dataset with validation to filter out corrupted videos
     dataset = PoseVideoDataset(root_dir=data_dir, validate_files=False)
-    # test_dataset = PoseVideoDataset(root_dir=test_dir, validate_files=False)
+    test_dataset = PoseVideoDataset(root_dir=test_dir, validate_files=False)
     
     if len(dataset) == 0:
         print("No valid videos found in the dataset. Please check your data files.")
@@ -662,21 +662,20 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
     # Split dataset into train and test sets
     train_size = int(0.8 * len(dataset))
     eval_size = int(0.2 * len(dataset))
-    test_size = 0 # int(0.15 * len(dataset))
-    e = len(dataset) - train_size - eval_size - test_size
-    train_dataset, eval_dataset, test_dataset, _ = random_split(dataset, [train_size, eval_size, test_size, e])
+    e = len(dataset) - train_size - eval_size
+    train_dataset, eval_dataset, _ = random_split(dataset, [train_size, eval_size, e])
 
     for i in random.sample(train_dataset.indices, 2):
         print(dataset.video_files[i])
     for i in random.sample(eval_dataset.indices, 2):
         print(dataset.video_files[i])
-    # for i in random.sample(test_dataset.indices, 2):
-    #     print(dataset.video_files[i])
+    for i in random.sample(test_dataset.indices, 2):
+        print(dataset.video_files[i])
 
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
-    # test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     print(f"Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}, Test size: {len(test_dataset)}")
 
@@ -863,10 +862,10 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             overfit = 0
             best_eval_loss = eval_loss
             # Save the trained model
-            torch.save(model.state_dict(), f"sign_language_pose_model_v3.1_{epoch+1}_best.pth")
+            torch.save(model.state_dict(), f"sign_language_pose_model_v3.2_{epoch+1}_best.pth")
         else:
             overfit += 1
-            torch.save(model.state_dict(), f"sign_language_pose_model_v3.1_{epoch+1}.pth")
+            torch.save(model.state_dict(), f"sign_language_pose_model_v3.2_{epoch+1}.pth")
             # if(overfit > 5):
             #     break
 
@@ -888,50 +887,68 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         
     print(f"\nTraining completed in {num_epochs} epochs")
 
-    # # Evaluation on test data
-    # print("\nEvaluating model on test data...")
-    # model.eval()  # Set model to evaluation mode
-    # test_loss = 0
-    # test_pose_loss = 0
-    # test_R_loss = 0
-    # test_kl_loss = 0
-    # test_vel_loss = 0
-    # test_dir_loss = 0
-    
-    # # Progress bar for test batches
-    # test_pbar = tqdm(
-    #     test_loader, 
-    #     desc="Testing", 
-    #     total=len(test_loader)
-    # )
+    # Evaluation on test data
+    print("\nEvaluating model on test data...")
+    model.eval()  # Set model to evaluation mode
+    test_loss = 0
+    test_pose_loss = 0
+    test_R_loss = 0
+    test_kl_loss = 0
+    test_vel_loss = 0
+    test_dir_loss = 0
 
-    # with torch.no_grad():  # No gradient computation
-    #     for i, batch in enumerate(test_pbar):
-    #         # video_data = batch["video"]
-    #         pose_data = batch["pose"]
+    # Progress bar for test batches
+    test_pbar = tqdm(
+        test_loader, 
+        desc="testing", 
+        total=len(test_loader),
+        leave=False, 
+        position=1,
+    )
 
-    #         # Forward pass with pose data as input instead of video
-    #         model_output, mu, logvar = model(pose_data)
+    with torch.no_grad():  # No gradient computation
+        for i, batch in enumerate(test_pbar):
+            # video_data = batch["video"]
+            pose_data = batch["pose"]
+
+            # Forward pass with pose data as input instead of video
+            model_output, mu, logvar = model(pose_data)
+
+            # Compute loss
+            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
             
-    #         # Compute Loss
-    #         loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss_val = loss
+            pose_loss_val = pose_loss
+            R_loss_val = R_loss
+            kl_loss_val = kl_loss
+            vel_loss_val = vel_loss
+            dir_loss_val = dir_loss
 
-    #         test_loss += loss
-    #         test_pose_loss += pose_loss
-    #         test_R_loss += R_loss
-    #         test_kl_loss += kl_loss
-    #         test_vel_loss += vel_loss
-    #         test_dir_loss += dir_loss
+            test_loss += loss_val
+            test_pose_loss += pose_loss_val
+            test_R_loss += R_loss_val
+            test_kl_loss += kl_loss_val
+            test_vel_loss += vel_loss_val
+            test_dir_loss += dir_loss_val
 
-    # test_loss /= len(test_loader)
-    # test_pose_loss /= len(test_loader)
-    # test_R_loss /= len(test_loader)
-    # test_kl_loss /= len(test_loader)
-    # test_vel_loss /= len(test_loader)
-    # test_dir_loss /= len(test_loader)
+            # Update progress bar
+            test_pbar.set_postfix({
+                'loss': f'{loss_val:.2f}', 
+                'pose_loss': f'{pose_loss_val:.2f}', 
+                # 'R_loss': f'{R_loss_val:.2f}', 
+                'kl_loss': f'{kl_loss_val:.2f}', 
+                # 'vel_loss': f'{vel_loss_val:.2f}', 
+                # 'dir_loss': f'{dir_loss_val:.2f}'
+            })
+    test_loss /= len(test_loader)
+    test_pose_loss /= len(test_loader)
+    test_R_loss /= len(test_loader)
+    test_kl_loss /= len(test_loader)
+    test_vel_loss /= len(test_loader)
+    test_dir_loss /= len(test_loader)
 
-    # print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, R Loss: {test_R_loss:.5f}, "
-    #       f"KL Loss: {test_kl_loss:.5f}, Vel Loss: {test_vel_loss:.5f}, dir Loss: {test_dir_loss:.5f}")
+    print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, R Loss: {test_R_loss:.5f}, "
+          f"KL Loss: {test_kl_loss:.5f}, Vel Loss: {test_vel_loss:.5f}, dir Loss: {test_dir_loss:.5f}")
 
 def main():
     """Main function to parse arguments and run the training or testing process"""
