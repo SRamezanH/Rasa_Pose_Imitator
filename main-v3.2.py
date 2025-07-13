@@ -207,7 +207,7 @@ class PoseVideoDataset(Dataset):
         # Load pose data from protobuf
         pose_data = self._load_protobuf(pb_path)
 
-        sample = {"video": video_data, "pose": pose_data}
+        sample = {"name": video_path, "video": video_data, "pose": pose_data}
 
         if self.transform:
             sample = self.transform(sample)
