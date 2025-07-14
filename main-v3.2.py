@@ -665,12 +665,12 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
     e = len(dataset) - train_size - eval_size
     train_dataset, eval_dataset, _ = random_split(dataset, [train_size, eval_size, e])
 
-    for i in random.sample(train_dataset.indices, 2):
-        print(dataset.video_files[i])
-    for i in random.sample(eval_dataset.indices, 2):
-        print(dataset.video_files[i])
-    for i in random.sample(test_dataset.indices, 2):
-        print(dataset.video_files[i])
+    # for i in random.sample(train_dataset.indices, 2):
+    #     print(dataset.video_files[i])
+    # for i in random.sample(eval_dataset.indices, 2):
+    #     print(dataset.video_files[i])
+    # for i in random.sample(test_dataset.indices, 2):
+    #     print(dataset.video_files[i])
 
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -960,8 +960,8 @@ def main():
     DEFAULT_DATA_DIR = "/home/cedra/psl_project/5_dataset"
     TEST_DATA_DIR = "/home/cedra/psl_project/5_dataset/test"
     DEFAULT_URDF_PATH = "/home/cedra/psl_project/rasa/hand.urdf"
-    DEFAULT_NUM_EPOCHS = 100
-    DEFAULT_BATCH_SIZE = 16
+    DEFAULT_NUM_EPOCHS = 500
+    DEFAULT_BATCH_SIZE = 64
     DEFAULT_TEST_ONLY = False
     DEFAULT_EXTRACT_ZIP = None
 
