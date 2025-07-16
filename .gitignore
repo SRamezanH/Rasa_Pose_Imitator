@@ -8,6 +8,7 @@ model_test/fig_4/
 psl_venv/
 dataset/
 meshes/
+.kiro/
 
 # Ignore specific file types
 *.nix
