@@ -111,20 +111,20 @@ class ProtobufProcessor:
         if landmarks.shape[0] < 10:
             return torch.zeros((1, 3, 3))  # Return zero if less than 2 landmarks
         
-        origin = landmarks[1]#.clone().detach()
+        origin = landmarks[1].clone().detach()
         # Compute the distance between the shoulder and elbow as the scale factor
-        L = (torch.linalg.vector_norm(landmarks[1] - landmarks[3]) + torch.linalg.vector_norm(landmarks[3] - landmarks[5]))/2.0#.clone().detach()/2.0
+        L = (torch.linalg.vector_norm(landmarks[1] - landmarks[3]) + torch.linalg.vector_norm(landmarks[3] - landmarks[5])).clone().detach()/2.0
         indices = [5, 7, 9]
         if left_side:
             indices = [4, 6, 8]
             landmarks[:, 0] *= -1
-            origin = landmarks[0]#.clone().detach()
+            origin = landmarks[0].clone().detach()
             # Compute the distance between the shoulder and elbow as the scale factor
-            L = (torch.linalg.vector_norm(landmarks[0] - landmarks[2]) + torch.linalg.vector_norm(landmarks[4] - landmarks[2]))/2.0#.clone().detach()/2.0
+            L = (torch.linalg.vector_norm(landmarks[0] - landmarks[2]) + torch.linalg.vector_norm(landmarks[4] - landmarks[2])).clone().detach()/2.0
         
         L = L if L > 0 else 1.0  # Prevent division by zero
 
-        landmarks = (landmarks - origin) / L  # Wrist as reference
+        landmarks = (landmarks - origin) / L # Wrist as reference
 
         # Normalize hand landmarks
         return landmarks[indices].unsqueeze(0)
@@ -536,13 +536,13 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     u = u / (torch.norm(u, dim=-1, keepdim=True) + eps)
     v = pose[:,:,1] - root
     v = v / (torch.norm(v, dim=-1, keepdim=True) + eps)
-
+    
     # Orthogonalize v w.r.t. u (Gram-Schmidt)
     v_ortho = v - (torch.sum(u * v, dim=-1, keepdim=True) * u)
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
-
+    
     # Stack u and v_ortho to form 6D representation
-    six_d = torch.cat([u, v_ortho], dim=-1)  # Shape: (B, N, 6)
+    six_d = torch.stack([root, root+0.2*u, root+0.2*v_ortho], dim=-1)
     return six_d
 
 def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, single=False):
