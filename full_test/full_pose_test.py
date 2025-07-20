@@ -191,8 +191,6 @@ def _load_protobuf(pb_path):
         print("Low frame count" + pb_path)
         padding = torch.zeros([15 - num_frames, feature_size, dim_size ]).to(device)
         pose_tensor = torch.cat((pose_tensor, padding), dim=0)
-    elif num_frames > 15:
-        pose_tensor = pose_tensor[:15, :, :]
 
     return batch_vectors_to_6D(pose_tensor), viz_tensor
 
@@ -668,7 +666,7 @@ def test_model_pose(pose_dir, urdf_path, model_path, output_path):
                 model_output, _, _ = model(pose_input, deterministic=True)
                 
                 # Apply Hamming window weighting for smooth aggregation
-                weighted_output = model_output.squeeze(0) * window.squeeze()  # Remove batch dim and apply window
+                weighted_output = model_output.squeeze(0) * window.squeeze(0)  # Remove batch dim and apply window
                 
                 # Accumulate weighted results for overlapping regions
                 chunk_mask = (frame_indices >= start_frame) & (frame_indices < end_frame)
@@ -680,7 +678,7 @@ def test_model_pose(pose_dir, urdf_path, model_path, output_path):
                 
                 chunk_name = f"{pose_name}_{start_frame}_{end_frame-1}"
                 f.write(f"Chunk {chunk_name}: Pose Loss: {chunk_pose_loss:.5f}\n")
-                print(f"Chunk {chunk_name}: Pose Loss: {chunk_pose_loss:.5f}")
+                # print(f"Chunk {chunk_name}: Pose Loss: {chunk_pose_loss:.5f}")
             
             # Normalize accumulated output by weights to handle overlapping regions
             full_weights = torch.clamp(full_weights, min=1e-8)  # Prevent division by zero
@@ -703,15 +701,27 @@ def test_model_pose(pose_dir, urdf_path, model_path, output_path):
         print("Testing completed!")
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(description="Test pose-based sign language recognition model")
-    parser.add_argument("--pose_dir", type=str, required=True, help="Directory containing pose protobuf files")
-    parser.add_argument("--urdf_path", type=str, required=True, help="Path to URDF file")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to trained model")
-    parser.add_argument("--output_path", type=str, required=True, help="Output directory for results")
+    parser.add_argument("--pose_dir", type=str, required=False, help="Directory containing pose protobuf files")
+    parser.add_argument("--urdf_path", type=str, required=False, help="Path to URDF file")
+    parser.add_argument("--model_name", type=str, required=False, help="Name of trained model")
+    parser.add_argument("--output_path", type=str, required=False, help="Output directory for results")
     
     args = parser.parse_args()
+
+    name = args.model_name if args.model_name is not None else "1_best"
+    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.2_"+name+".pth"
+
+    urdf_path = args.urdf_path if args.urdf_path is not None else "/home/cedra/psl_project/rasa/hand.urdf"
+    output_path = args.output_path if args.output_path is not None else "/home/cedra/psl_project/full_test/fig/"
+    
+    if not args.pose_dir:
+        pose_dir = "/home/cedra/psl_project/clips/"
+    else:
+        pose_dir = args.pose_dir
     
     # Create output directory if it doesn't exist
-    os.makedirs(args.output_path, exist_ok=True)
+    os.makedirs(output_path, exist_ok=True)
     
-    test_model_pose(args.pose_dir, args.urdf_path, args.model_path, args.output_path)
+    test_model_pose(pose_dir, urdf_path, model_path, output_path)
