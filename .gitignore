@@ -5,6 +5,7 @@ clips/
 rasa/
 model_test/fig/
 model_test/fig_4/
+full_test/fig/
 psl_venv/
 dataset/
 meshes/
