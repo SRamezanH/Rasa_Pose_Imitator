@@ -569,7 +569,7 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     six_d = torch.stack([root, root+0.2*u, root+0.2*v_ortho], dim=-1)
     return six_d
 
-def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
+def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_max=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
     """
     Computes the loss between the predicted and actual pose data (no FK needed)
     
@@ -586,34 +586,24 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1
     Returns:
         Tuple of total loss and individual loss components
     """
-    kine_output = fk.batch_forward_kinematics(model_output)    
+    kine_output = fk.batch_forward_kinematics(model_output)
+
     # calculate position loss using 6d representation
+    pose_loss = 0#mse_loss(kine_output, pose_data)
     errors = torch.abs(kine_output - pose_data)
     max_per_joint, _ = torch.max(
             errors.view(errors.size(0), errors.size(1), -1),
             dim=1  # Reduce across frames and coordinates
         )
-    pose_loss = torch.mean(max_per_joint)
+    max_loss = torch.mean(max_per_joint)
 
     # KL divergence loss for VAE regularization
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
-    # Rotation loss in 6D representation
-    # input_6d = batch_vectors_to_6D(pose_data, eps=eps)
-    # output_6d = batch_vectors_to_6D(model_output, eps=eps)
-    # R_loss = torch.mean((output_6d - input_6d) ** 2)
-    # R_loss = torch.mean((model_output - input_6d) ** 2)
-
-    # Velocity loss based on movement of first vector of rotation matrix (e.g., palm position)
-    # velocity_in = torch.diff(input_6d, dim=1)  # [batch, 14, 6]
-    # velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 6]
-    # dir_loss = 1.0 - F.cosine_similarity(velocity_in.view(-1, 6), velocity_out.view(-1, 6), dim=-1).mean()
-    # vel_loss = mse_loss(velocity_in, velocity_out)
-
     # Combine all loss terms
-    loss = pose_loss + lambda_kl * kl_loss #+ lambda_R * R_loss + lambda_vel * (vel_loss + 0.5*dir_loss)
+    loss = pose_loss + lambda_kl * kl_loss + lambda_max * max_loss
 
-    return loss, pose_loss, 0, kl_loss, 0, 0#R_loss, kl_loss, vel_loss, dir_loss
+    return loss, pose_loss, max_loss, kl_loss
 
 def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0.5):
     """Linear warmup for velocity loss coefficient"""
@@ -730,10 +720,8 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         model.train()  # Set model to training mode
         total_loss = 0
         total_pose_loss = 0
-        total_R_loss = 0
+        total_max_loss = 0
         total_kl_loss = 0
-        total_vel_loss = 0
-        total_dir_loss = 0
 
         # Create progress bar for batches
         batch_pbar = tqdm(
@@ -744,9 +732,8 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             total=len(train_loader)
         )
 
-        lambda_kl = 0.1 * (1 - min(0.9, 0.005 * (epoch+1)))
-        lambda_R = lambda_scheduler(epoch, warmup_start=10, warmup_end=20, final_value=1.0)
-        lambda_vel = lambda_scheduler(epoch, warmup_start=5, warmup_end=45, final_value=30)
+        lambda_kl = lambda_scheduler(epoch, warmup_start=5, warmup_end=15, final_value=0.1)#0.1 * (min(1, 0.005 * (epoch+1)))
+        lambda_max = 1.0#lambda_scheduler(epoch, warmup_start=5, warmup_end=15, final_value=1.0)
 
         for i, batch in enumerate(batch_pbar):
             # video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
@@ -757,7 +744,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             model_output, mu, logvar = model(pose_data)  # Output: [batch, 15, 6] (predicted)
 
             # Compute loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
@@ -766,44 +753,34 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
             # Update running loss
             loss_val = loss.item()
-            pose_loss_val = pose_loss.item()
-            R_loss_val = 0#R_loss.item()
+            pose_loss_val = 0#pose_loss.item()
+            max_loss_val = max_loss.item()
             kl_loss_val = kl_loss.item()
-            vel_loss_val = 0#vel_loss.item()
-            dir_loss_val = 0#dir_loss.item()
             
             total_loss += loss_val
             total_pose_loss += pose_loss_val
-            total_R_loss += R_loss_val
+            total_max_loss += max_loss_val
             total_kl_loss += kl_loss_val
-            total_vel_loss += vel_loss_val
-            total_dir_loss += dir_loss_val
             
             # Update progress bar with current loss
             batch_pbar.set_postfix({
                 'loss': f'{loss_val:.2f}', 
                 'pose_loss': f'{pose_loss_val:.2f}', 
-                # 'R_loss': f'{R_loss_val:.2f}', 
-                'kl_loss': f'{kl_loss_val:.2f}', 
-                # 'vel_loss': f'{vel_loss_val:.2f}', 
-                # 'dir_loss': f'{dir_loss_val:.2f}'
+                'max_loss': f'{max_loss_val:.2f}', 
+                'kl_loss': f'{kl_loss_val:.2f}'
             })
         
         total_loss /= len(train_loader)
         total_pose_loss /= len(train_loader)
-        total_R_loss /= len(train_loader)
+        total_max_loss /= len(train_loader)
         total_kl_loss /= len(train_loader)
-        total_vel_loss /= len(train_loader)
-        total_dir_loss /= len(train_loader)
 
         # Evaluation
         model.eval()  # Set model to evaluation mode
         eval_loss = 0
         eval_pose_loss = 0
-        eval_R_loss = 0
+        eval_max_loss = 0
         eval_kl_loss = 0
-        eval_vel_loss = 0
-        eval_dir_loss = 0
     
         # Progress bar for test batches
         eval_pbar = tqdm(
@@ -823,37 +800,29 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
                 model_output, mu, logvar = model(pose_data)
 
                 # Compute loss
-                loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+                loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
                 
                 loss_val = loss
                 pose_loss_val = pose_loss
-                R_loss_val = R_loss
+                max_loss_val = max_loss
                 kl_loss_val = kl_loss
-                vel_loss_val = vel_loss
-                dir_loss_val = dir_loss
 
                 eval_loss += loss_val
                 eval_pose_loss += pose_loss_val
-                eval_R_loss += R_loss_val
+                eval_max_loss += max_loss_val
                 eval_kl_loss += kl_loss_val
-                eval_vel_loss += vel_loss_val
-                eval_dir_loss += dir_loss_val
 
                 # Update progress bar
                 eval_pbar.set_postfix({
                     'loss': f'{loss_val:.2f}', 
                     'pose_loss': f'{pose_loss_val:.2f}', 
-                    # 'R_loss': f'{R_loss_val:.2f}', 
-                    'kl_loss': f'{kl_loss_val:.2f}', 
-                    # 'vel_loss': f'{vel_loss_val:.2f}', 
-                    # 'dir_loss': f'{dir_loss_val:.2f}'
+                    'max_loss': f'{max_loss_val:.2f}', 
+                    'kl_loss': f'{kl_loss_val:.2f}'
                 })
         eval_loss /= len(eval_loader)
         eval_pose_loss /= len(eval_loader)
-        eval_R_loss /= len(eval_loader)
+        eval_max_loss /= len(eval_loader)
         eval_kl_loss /= len(eval_loader)
-        eval_vel_loss /= len(eval_loader)
-        eval_dir_loss /= len(eval_loader)
 
         scheduler.step(eval_loss)
 
@@ -880,22 +849,21 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
         # Print epoch summary
         print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s\n" 
-              f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f},"# R Loss: {total_R_loss:.5f}, "
+              f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, max Loss: {total_max_loss:.5f}, "
               f"KL Loss: {total_kl_loss:.5f}\n"#, Vel Loss: {total_vel_loss:.5f}, dir Loss: {total_dir_loss:.5f}\n"
-              f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f},"# R Loss: {eval_R_loss:.5f}, "
+              f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, max Loss: {eval_max_loss:.5f}, "
               f"KL Loss: {eval_kl_loss:.5f}")#, Vel Loss: {eval_vel_loss:.5f}, dir Loss: {eval_dir_loss:.5f}")
         
     print(f"\nTraining completed in {num_epochs} epochs")
 
     # Evaluation on test data
+    # model.load_state_dict(torch.load("/home/cedra/psl_project/sign_language_pose_model_v3.2_100.pth", weights_only=True))
     print("\nEvaluating model on test data...")
     model.eval()  # Set model to evaluation mode
     test_loss = 0
     test_pose_loss = 0
-    test_R_loss = 0
+    test_max_loss = 0
     test_kl_loss = 0
-    test_vel_loss = 0
-    test_dir_loss = 0
 
     # Progress bar for test batches
     test_pbar = tqdm(
@@ -905,6 +873,9 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         leave=False, 
         position=1,
     )
+
+    lambda_kl = 0.1
+    lambda_max = 1.0
 
     with torch.no_grad():  # No gradient computation
         f = open("test.log", 'w')
@@ -916,42 +887,36 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             model_output, mu, logvar = model(pose_data)
 
             # Compute loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
             
             loss_val = loss
             pose_loss_val = pose_loss
-            R_loss_val = R_loss
+            max_loss_val = max_loss
             kl_loss_val = kl_loss
-            vel_loss_val = vel_loss
-            dir_loss_val = dir_loss
 
-            f.write(str(batch["name"][0])+","+str(loss_val.item())+","+str(pose_loss_val.item())+","+str(kl_loss_val.item())+"\n")
+            f.write(str(batch["name"][0])+","+str(loss_val)+","+str(pose_loss_val)+","+str(max_loss_val)+","+str(kl_loss_val)+"\n")
 
             test_loss += loss_val
             test_pose_loss += pose_loss_val
-            test_R_loss += R_loss_val
+            test_max_loss += max_loss_val
             test_kl_loss += kl_loss_val
-            test_vel_loss += vel_loss_val
-            test_dir_loss += dir_loss_val
 
             # Update progress bar
             test_pbar.set_postfix({
                 'loss': f'{loss_val:.2f}', 
                 'pose_loss': f'{pose_loss_val:.2f}', 
-                # 'R_loss': f'{R_loss_val:.2f}', 
+                'max_loss': f'{max_loss_val:.2f}', 
                 'kl_loss': f'{kl_loss_val:.2f}', 
                 # 'vel_loss': f'{vel_loss_val:.2f}', 
                 # 'dir_loss': f'{dir_loss_val:.2f}'
             })
     test_loss /= len(test_loader)
     test_pose_loss /= len(test_loader)
-    test_R_loss /= len(test_loader)
+    test_max_loss /= len(test_loader)
     test_kl_loss /= len(test_loader)
-    test_vel_loss /= len(test_loader)
-    test_dir_loss /= len(test_loader)
 
-    print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, R Loss: {test_R_loss:.5f}, "
-          f"KL Loss: {test_kl_loss:.5f}, Vel Loss: {test_vel_loss:.5f}, dir Loss: {test_dir_loss:.5f}")
+    print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, max Loss: {test_max_loss:.5f}, "
+          f"KL Loss: {test_kl_loss:.5f}")
 
 def main():
     """Main function to parse arguments and run the training or testing process"""
@@ -960,7 +925,7 @@ def main():
     DEFAULT_DATA_DIR = "/home/cedra/psl_project/5_dataset"
     TEST_DATA_DIR = "/home/cedra/psl_project/5_dataset/test"
     DEFAULT_URDF_PATH = "/home/cedra/psl_project/rasa/hand.urdf"
-    DEFAULT_NUM_EPOCHS = 500
+    DEFAULT_NUM_EPOCHS = 100
     DEFAULT_BATCH_SIZE = 64
     DEFAULT_TEST_ONLY = False
     DEFAULT_EXTRACT_ZIP = None
