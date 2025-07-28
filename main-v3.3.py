@@ -164,7 +164,7 @@ class PoseVideoDataset(Dataset):
         self.video_files = sorted(glob.glob(os.path.join(root_dir, "*.mp4")))
         self.valid_indices = []
         self.print_warnings = True
-        
+
         if validate_files:
             print("Validating video files...")
             # Use tqdm if available for progress bar
@@ -173,30 +173,30 @@ class PoseVideoDataset(Dataset):
                 iterator = tqdm(enumerate(self.video_files), total=len(self.video_files), desc="Validating videos")
             except ImportError:
                 iterator = enumerate(self.video_files)
-                
+
             for i, video_path in iterator:
                 pb_path = video_path.replace(".mp4", ".pb")
                 is_valid = True
-                
+
                 # Check if video file can be opened
                 try:
                     video_test, _, _ = read_video(video_path ,output_format="TCHW")
                     is_valid = video_test.shape[0] == 15
-                    
+
                     # Check if protobuf file exists and can be loaded
                     if is_valid and not os.path.exists(pb_path):
                         if self.print_warnings:
                             print(f"Warning: Missing protobuf file for {video_path}")
                         is_valid = False
-                    
+
                 except Exception as e:
                     if self.print_warnings:
                         print(f"Warning: Error validating {video_path}: {str(e)}")
                     is_valid = False
-                
+
                 if is_valid:
                     self.valid_indices.append(i)
-            
+
             print(f"Found {len(self.valid_indices)} valid videos out of {len(self.video_files)} total videos")
         else:
             # If not validating, assume all files are valid
@@ -324,12 +324,13 @@ class PoseVideoCNNRNN(nn.Module):
         )
 
         # Final linear output: map back to (15 time steps, 7 values each)
-        self.fc_output = nn.Linear(15 * 10 * 3, 15 * 7)
+        # self.fc_output = nn.Linear(15 * 10 * 3, 15 * 7)
+        self.fc_output = nn.Linear(640, 15 * 7)
 
     def forward(self, pose_input, deterministic=False):
         # pose_input: (B, 15, 10, 3)
-        x = pose_input.permute(0, 4 - 1, 1, 2)  # → (B, 1, 15, 10, 3)
-
+        # x = pose_input.permute(0, 4 - 1, 1, 2)  # → (B, 1, 15, 10, 3)
+        x = pose_input.unsqueeze(1)
         # --- Encoder
         h = self.encoder(x)
         mu = self.fc_mu(h)
@@ -507,17 +508,17 @@ def test_dataset(data_dir):
     try:
         print("\nCreating dataset and validating files...")
         dataset = PoseVideoDataset(root_dir=data_dir, validate_files=False)
-        
+
         if len(dataset) == 0:
             print(f"❌ No valid videos found in the dataset. Please check your data files.")
             return
-            
+
         print(f"✅ Successfully created dataset with {len(dataset)} valid samples.")
-        
+
         # Calculate what percentage of videos are valid
         valid_ratio = len(dataset) / len(video_files) * 100
         print(f"📊 {valid_ratio:.1f}% of videos are valid and will be used for training/testing.")
-        
+
     except Exception as e:
         print(f"❌ Error creating dataset: {e}")
         return
@@ -547,7 +548,7 @@ def test_dataset(data_dir):
 
         print("\nTesting batch loading:")
         from tqdm import tqdm
-        
+
         # Load a few batches with progress bar
         max_batches = min(3, len(dataloader))
         for i, batch in enumerate(tqdm(dataloader, desc="Loading batches", total=max_batches)):
@@ -584,11 +585,11 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     u = u / (torch.norm(u, dim=-1, keepdim=True) + eps)
     v = pose[:,:,1] - root
     v = v / (torch.norm(v, dim=-1, keepdim=True) + eps)
-    
+
     # Orthogonalize v w.r.t. u (Gram-Schmidt)
     v_ortho = v - (torch.sum(u * v, dim=-1, keepdim=True) * u)
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
-    
+
     # Stack u and v_ortho to form 6D representation
     six_d = torch.stack([root, root+0.2*u, root+0.2*v_ortho], dim=-1)
     return six_d
@@ -596,7 +597,7 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
 def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_max=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
     """
     Computes the loss between the predicted and actual pose data (no FK needed)
-    
+
     Args:
         pose_data: Ground truth pose data [batch, 15, 3, 3]
         model_output: Model predictions [batch, 15, 6] => directly output from network in 6D form
@@ -606,7 +607,7 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_max=1.0, lambda_kl=0
         lambda_kl: Weight for KL divergence loss
         lambda_vel: Weight for velocity loss
         eps: Small epsilon value to prevent division by zero
-        
+
     Returns:
         Tuple of total loss and individual loss components
     """
@@ -662,15 +663,15 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
     # Create dataset with validation to filter out corrupted videos
     dataset = PoseVideoDataset(root_dir=data_dir, validate_files=False)
     test_dataset = PoseVideoDataset(root_dir=test_dir, validate_files=False)
-    
+
     if len(dataset) == 0:
         print("No valid videos found in the dataset. Please check your data files.")
         return
-    
+
     # if len(test_dataset) == 0:
     #     print("No valid videos found in the test dataset. Please check your data files.")
     #     return
-        
+
     print(f"Dataset loaded: {len(dataset)} valid samples")
 
     # Split dataset into train and test sets
@@ -724,7 +725,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
     # Initialize forward kinematics
     fk = ForwardKinematics(urdf_path)
-    
+
     # Import tqdm for progress bars
     from tqdm import tqdm
     import time
@@ -734,7 +735,7 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
     overfit = 0
     # Create progress bar for epochs
     epoch_pbar = tqdm(range(num_epochs), desc="Epochs", position=0)
-    
+
     # Training loop
     for epoch in epoch_pbar:
         # Start time for this epoch
@@ -749,9 +750,9 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
         # Create progress bar for batches
         batch_pbar = tqdm(
-            train_loader, 
-            desc=f"Epoch {epoch+1}/{num_epochs}", 
-            leave=False, 
+            train_loader,
+            desc=f"Epoch {epoch+1}/{num_epochs}",
+            leave=False,
             position=1,
             total=len(train_loader)
         )
@@ -761,8 +762,8 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
         for i, batch in enumerate(batch_pbar):
             # video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
-            pose_data = batch["pose"]  # Shape: [batch, 15, 3, 3] (ground truth)
-            
+            pose_data = batch["pose"].to(device)  # Shape: [batch, 15, 3, 3] (ground truth)
+
             # model_output, mu, logvar = model(video_data)  # Output: [batch, 15, 26] (predicted)
             # pose data as input instead of video
             model_output, mu, logvar = model(pose_data)  # Output: [batch, 15, 6] (predicted)
@@ -780,20 +781,20 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             pose_loss_val = 0#pose_loss.item()
             max_loss_val = max_loss.item()
             kl_loss_val = kl_loss.item()
-            
+
             total_loss += loss_val
             total_pose_loss += pose_loss_val
             total_max_loss += max_loss_val
             total_kl_loss += kl_loss_val
-            
+
             # Update progress bar with current loss
             batch_pbar.set_postfix({
-                'loss': f'{loss_val:.2f}', 
-                'pose_loss': f'{pose_loss_val:.2f}', 
-                'max_loss': f'{max_loss_val:.2f}', 
+                'loss': f'{loss_val:.2f}',
+                'pose_loss': f'{pose_loss_val:.2f}',
+                'max_loss': f'{max_loss_val:.2f}',
                 'kl_loss': f'{kl_loss_val:.2f}'
             })
-        
+
         total_loss /= len(train_loader)
         total_pose_loss /= len(train_loader)
         total_max_loss /= len(train_loader)
@@ -805,27 +806,27 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         eval_pose_loss = 0
         eval_max_loss = 0
         eval_kl_loss = 0
-    
+
         # Progress bar for test batches
         eval_pbar = tqdm(
-    	    eval_loader, 
-            desc="Evaluating", 
+    	    eval_loader,
+            desc="Evaluating",
             total=len(eval_loader),
-            leave=False, 
+            leave=False,
             position=1,
         )
 
         with torch.no_grad():  # No gradient computation
             for i, batch in enumerate(eval_pbar):
                 # video_data = batch["video"]
-                pose_data = batch["pose"]
+                pose_data = batch["pose"].to(device)
 
                 # Forward pass with pose data as input instead of video
                 model_output, mu, logvar = model(pose_data)
 
                 # Compute loss
                 loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
-                
+
                 loss_val = loss
                 pose_loss_val = pose_loss
                 max_loss_val = max_loss
@@ -838,9 +839,9 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
                 # Update progress bar
                 eval_pbar.set_postfix({
-                    'loss': f'{loss_val:.2f}', 
-                    'pose_loss': f'{pose_loss_val:.2f}', 
-                    'max_loss': f'{max_loss_val:.2f}', 
+                    'loss': f'{loss_val:.2f}',
+                    'pose_loss': f'{pose_loss_val:.2f}',
+                    'max_loss': f'{max_loss_val:.2f}',
                     'kl_loss': f'{kl_loss_val:.2f}'
                 })
         eval_loss /= len(eval_loader)
@@ -872,12 +873,12 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         })
 
         # Print epoch summary
-        print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s\n" 
+        print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s\n"
               f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, max Loss: {total_max_loss:.5f}, "
               f"KL Loss: {total_kl_loss:.5f}\n"#, Vel Loss: {total_vel_loss:.5f}, dir Loss: {total_dir_loss:.5f}\n"
               f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, max Loss: {eval_max_loss:.5f}, "
               f"KL Loss: {eval_kl_loss:.5f}")#, Vel Loss: {eval_vel_loss:.5f}, dir Loss: {eval_dir_loss:.5f}")
-        
+
     print(f"\nTraining completed in {num_epochs} epochs")
 
     # Evaluation on test data
@@ -891,10 +892,10 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
     # Progress bar for test batches
     test_pbar = tqdm(
-        test_loader, 
-        desc="testing", 
+        test_loader,
+        desc="testing",
         total=len(test_loader),
-        leave=False, 
+        leave=False,
         position=1,
     )
 
@@ -905,14 +906,14 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         f = open("test.log", 'w')
         for i, batch in enumerate(test_pbar):
             # video_data = batch["video"]
-            pose_data = batch["pose"]
+            pose_data = batch["pose"].to(device)
 
             # Forward pass with pose data as input instead of video
             model_output, mu, logvar = model(pose_data)
 
             # Compute loss
             loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
-            
+
             loss_val = loss
             pose_loss_val = pose_loss
             max_loss_val = max_loss
@@ -927,11 +928,11 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
 
             # Update progress bar
             test_pbar.set_postfix({
-                'loss': f'{loss_val:.2f}', 
-                'pose_loss': f'{pose_loss_val:.2f}', 
-                'max_loss': f'{max_loss_val:.2f}', 
-                'kl_loss': f'{kl_loss_val:.2f}', 
-                # 'vel_loss': f'{vel_loss_val:.2f}', 
+                'loss': f'{loss_val:.2f}',
+                'pose_loss': f'{pose_loss_val:.2f}',
+                'max_loss': f'{max_loss_val:.2f}',
+                'kl_loss': f'{kl_loss_val:.2f}',
+                # 'vel_loss': f'{vel_loss_val:.2f}',
                 # 'dir_loss': f'{dir_loss_val:.2f}'
             })
     test_loss /= len(test_loader)
