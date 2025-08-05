@@ -711,7 +711,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     name = args.model_name if args.model_name is not None else "1_best"
-    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.2_"+name+".pth"
+    model_path = "/home/cedra/psl_project/results/final2/sign_language_pose_model_v3.2_"+name+".pth"
 
     urdf_path = args.urdf_path if args.urdf_path is not None else "/home/cedra/psl_project/rasa/hand.urdf"
     output_path = args.output_path if args.output_path is not None else "/home/cedra/psl_project/full_test/fig/"

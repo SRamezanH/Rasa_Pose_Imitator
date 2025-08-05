@@ -139,77 +139,84 @@ class ProtobufProcessor:
 
         return normalized[indices].unsqueeze(0)  # Shape: (1, 10, 3)
 
-def transform_points(points):
+def transform_points(data):
     """
-    Args:
-        points: Tensor of shape (batch, seq, N+2, 3), where the last two points are P1 and P2.
+    Transforms 3D points so that:
+    - Origin stays at (0,0,0)
+    - P1 (second last) becomes (1,0,0)
+    - P2 (last) lies in positive y half of x-y plane
+    Inputs:
+        data: Tensor of shape (B, S, N+2, 3)
     Returns:
-        transformed_points: Tensor of shape (batch, seq, N, 3), with P1 and P2 removed.
+        Transformed data: Tensor of shape (B, S, N, 3)
     """
-    batch, seq, _, _ = points.shape
-    P1 = points[..., -2, :]  # (batch, seq, 3)
-    P2 = points[..., -1, :]  # (batch, seq, 3)
-    other_points = points[..., :-2, :]  # (batch, seq, N, 3)
+    # Split input
+    P1 = data[..., -2, :]  # Shape: (B, S, 3)
+    P2 = data[..., -1, :]  # Shape: (B, S, 3)
+    points = data[..., :-2, :]  # Shape: (B, S, N, 3)
 
-    # Step 1: Compute scaling factor (norm of P1)
-    scale = 0.1 / torch.norm(P1, dim=-1, keepdim=True)  # (batch, seq, 1)
-    
-    # Scale all points
-    P1_scaled = P1 * scale  # (batch, seq, 3)
-    P2_scaled = P2 * scale  # (batch, seq, 3)
-    other_points_scaled = other_points * scale.unsqueeze(-1)  # (batch, seq, N, 3)
+    # Step 1: Normalize P1 to unit vector
+    v1 = P1  # (B, S, 3)
+    v1_norm = torch.norm(v1, dim=-1, keepdim=True)  # (B, S, 1)
+    v1_unit = v1 / (v1_norm + 1e-8)  # Avoid division by zero
 
-    # Step 2: Compute rotation matrix R1 (align P1_scaled with [1, 0, 0])
-    u = P1_scaled  # (batch, seq, 3)
-    u_norm = u / torch.norm(u, dim=-1, keepdim=True)  # Should be 1 already
+    # Target direction is x-axis
+    x_axis = torch.tensor([1.0, 0.0, 0.0], device=data.device).expand_as(v1)
 
-    # Find orthogonal vector v (batch, seq, 3)
-    # Case 1: u_x or u_y is non-zero
-    v = torch.stack([u[..., 1], -u[..., 0], torch.zeros_like(u[..., 0])], dim=-1)
-    v_norm = v / torch.norm(v, dim=-1, keepdim=True)
+    # Compute axis of rotation (cross product) and angle (dot product)
+    axis = torch.cross(v1_unit, x_axis, dim=-1)  # (B, S, 3)
+    axis_norm = torch.norm(axis, dim=-1, keepdim=True)
+    axis_unit = axis / (axis_norm + 1e-8)  # unit rotation axis
 
-    # Handle case where u_x and u_y are both 0 (P1 is along z-axis)
-    mask_zero = (torch.abs(u[..., 0]) < 1e-6) & (torch.abs(u[..., 1]) < 1e-6)
-    v_norm[mask_zero] = torch.tensor([1.0, 0.0, 0.0], device=points.device)
+    dot = (v1_unit * x_axis).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+    angle = torch.acos(dot)  # (B, S, 1)
 
-    # Compute w = u × v
-    w = torch.cross(u_norm, v_norm, dim=-1)  # (batch, seq, 3)
+    # Rodrigues' rotation formula to build rotation matrix R1
+    K = torch.zeros(*axis.shape[:-1], 3, 3, device=data.device)  # (B, S, 3, 3)
+    ax, ay, az = axis_unit.unbind(dim=-1)
+    zero = torch.zeros_like(ax)
 
-    # Construct R1 (transpose of [u, v, w])
-    R1 = torch.stack([u_norm, v_norm, w], dim=-1)  # (batch, seq, 3, 3)
+    K[..., 0, 1] = -az
+    K[..., 0, 2] = ay
+    K[..., 1, 0] = az
+    K[..., 1, 2] = -ax
+    K[..., 2, 0] = -ay
+    K[..., 2, 1] = ax
 
-    # Step 3: Apply R1 to P2_scaled and compute R2 (rotate P2 into x-y plane)
-    P2_rot1 = torch.einsum('bsij,bsj->bsi', R1, P2_scaled)  # (batch, seq, 3)
-    a, b, c = P2_rot1.unbind(-1)  # Each (batch, seq)
+    I = torch.eye(3, device=data.device).expand(*axis.shape[:-1], 3, 3)
+    sin = torch.sin(angle)[..., None]
+    cos = torch.cos(angle)[..., None]
+    K2 = K @ K
 
-    # Compute theta = -atan2(c, b)
-    theta = -torch.atan2(c, b)  # (batch, seq)
-    cos_theta = torch.cos(theta)
-    sin_theta = torch.sin(theta)
+    R1 = I + sin * K + (1 - cos) * K2  # Shape: (B, S, 3, 3)
 
-    # Construct R2 (rotation around x-axis)
-    R2 = torch.zeros(batch, seq, 3, 3, device=points.device)
-    R2[..., 0, 0] = 1.0
-    R2[..., 1, 1] = cos_theta
-    R2[..., 1, 2] = -sin_theta
-    R2[..., 2, 1] = sin_theta
-    R2[..., 2, 2] = cos_theta
+    # Apply R1 and scaling
+    points = points / (v1_norm[..., None] + 1e-8)  # scale
+    P2 = P2 / (v1_norm + 1e-8)
 
-    # Total rotation R = R2 @ R1
-    R = torch.einsum('bsij,bsjk->bsik', R2, R1)  # (batch, seq, 3, 3)
+    # Apply R1 to points and P2
+    points = torch.matmul(R1.unsqueeze(-3), points.unsqueeze(-1)).squeeze(-1)  # (B, S, N, 3)
+    P2 = torch.matmul(R1, P2.unsqueeze(-1)).squeeze(-1)  # (B, S, 3)
 
-    # Step 4: Transform all points
-    # Reshape for batch multiplication
-    other_points_flat = other_points_scaled.reshape(batch * seq, -1, 3)  # (batch*seq, N, 3)
-    R_flat = R.reshape(batch * seq, 3, 3)  # (batch*seq, 3, 3)
+    # Step 2: Rotate around x-axis to bring P2 into x-y plane (z=0)
+    yz = P2[..., 1:]  # (B, S, 2)
+    theta = torch.atan2(P2[..., 2], P2[..., 1])  # angle to rotate around x
 
-    # Apply rotation
-    transformed_flat = torch.einsum('bij,bkj->bki', R_flat, other_points_flat)  # (batch*seq, N, 3)
+    cos_t = torch.cos(-theta)
+    sin_t = torch.sin(-theta)
 
-    # Reshape back
-    transformed_points = transformed_flat.reshape(batch, seq, -1, 3)  # (batch, seq, N, 3)
+    # Build rotation matrix R2 (x-axis rotation)
+    R2 = torch.zeros(*theta.shape, 3, 3, device=data.device)
+    R2[..., 0, 0] = 1
+    R2[..., 1, 1] = cos_t
+    R2[..., 1, 2] = -sin_t
+    R2[..., 2, 1] = sin_t
+    R2[..., 2, 2] = cos_t
 
-    return torch.nan_to_num(transformed_points, nan=0.0)
+    # Apply R2 to points
+    points = torch.matmul(R2.unsqueeze(-3), points.unsqueeze(-1)).squeeze(-1)  # (B, S, N, 3)
+
+    return torch.nan_to_num(points, nan=0.0)
 
 # Dataset class for handling video and pose data
 class PoseVideoDataset(Dataset):
@@ -874,10 +881,10 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
             overfit = 0
             best_eval_loss = eval_loss
             # Save the trained model
-            torch.save(model.state_dict(), f"sign_language_pose_model_v3.2_{epoch+1}_best.pth")
+            torch.save(model.state_dict(), f"sign_language_finger_model_v1.0_{epoch+1}_best.pth")
         else:
             overfit += 1
-            torch.save(model.state_dict(), f"sign_language_pose_model_v3.2_{epoch+1}.pth")
+            torch.save(model.state_dict(), f"sign_language_finger_model_v1.0_{epoch+1}.pth")
             # if(overfit > 5):
             #     break
 
