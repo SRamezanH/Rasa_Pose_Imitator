@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 Sign Language Recognition using Pose Estimation and Deep Learning.
-This script processes video data and corresponding pose landmarks to train a model
+This script processes pose data from protobuf files to test a model
 for sign language recognition.
 """
 
 import argparse
 import glob
-# Standard library imports
+
 import os
 import shutil
 import sys
 import xml.etree.ElementTree as ET
 
-# Third-party imports
+
 import numpy as np
 import pytorch_kinematics as pk
 import matplotlib.pyplot as plt
@@ -24,7 +24,6 @@ from typing import Dict, List
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision.io import read_video
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import symbol_database as _symbol_database
@@ -71,7 +70,7 @@ if _descriptor._USE_C_DESCRIPTORS == False:
 this_module = sys.modules[__name__]
 pose_data_pb2 = this_module
 sys.modules["pose_data_pb2"] = this_module
-    
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Module for processing protobuf data
@@ -129,13 +128,13 @@ class ProtobufProcessor:
 
         # Normalize hand landmarks
         return landmarks[indices].unsqueeze(0)
-    
+
     @staticmethod
     def normalize_body_landmarks_for_viz(landmarks, left_side):
         """Normalize body landmarks using shoulders as reference points"""
         if landmarks.shape[0] < 10:
             return torch.zeros((1, 5, 3))  # Return zero if less than 2 landmarks
-        
+
         origin = landmarks[1].clone().detach()
         # Compute the distance between the shoulder and elbow as the scale factor
         L = (torch.linalg.vector_norm(landmarks[1] - landmarks[3]) + torch.linalg.vector_norm(landmarks[3] - landmarks[5])).clone().detach()/2.0
@@ -146,7 +145,7 @@ class ProtobufProcessor:
             origin = landmarks[0].clone().detach()
             # Compute the distance between the shoulder and elbow as the scale factor
             L = (torch.linalg.vector_norm(landmarks[0] - landmarks[2]) + torch.linalg.vector_norm(landmarks[4] - landmarks[2])).clone().detach()/2.0
-        
+
         L = L if L > 0 else 1.0  # Prevent division by zero
 
         landmarks = (landmarks - origin) / L # Wrist as reference
@@ -178,13 +177,11 @@ def _load_protobuf(pb_path):
         )  # Body landmarks
         
         # Normalize the extracted landmarks
-        # selected_landmarks, h = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
         selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
         selected_landmarks_for_viz = ProtobufProcessor.normalize_body_landmarks_for_viz(pose_landmarks, left_side)
 
         pose_tensor = torch.cat((pose_tensor, selected_landmarks), dim=0)
         viz_tensor = torch.cat((viz_tensor, selected_landmarks_for_viz), dim=0)
-        # break
 
     pose_tensor = pose_tensor.to(device)
 
@@ -194,34 +191,11 @@ def _load_protobuf(pb_path):
         print("Low frame count" + pb_path)
         padding = torch.zeros([15 - num_frames, feature_size, dim_size ]).to(device)
         pose_tensor = torch.cat((pose_tensor, padding), dim=0)
-    elif num_frames > 15:
-        pose_tensor = pose_tensor[:15, :, :]
 
     return batch_vectors_to_6D(pose_tensor), viz_tensor
 
-def _load_video(self, video_path):
-    """
-    Load and process video frames using OpenCV.
 
-    Args:
-        video_path (string): Path to the video file
-
-    Returns:
-        torch.Tensor: Tensor containing video frames with shape  [15, 3, 273, 210]
-    """
-    # Open the video file
-    # video, _, _ = read_video(video_path ,output_format="TCHW")
-    # video_tensor = video.to(device)
-    # video_tensor = video_tensor[:15, :3, :210, :273]
-    # num_frames, ch, h, w = video_tensor.shape
-    # if num_frames < 15:
-    #     print("Low frame count" + video_path)
-    #     padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
-    #     video_tensor = torch.cat((video_tensor, padding), dim=0)
-
-    #return video_tensor.permute(0,1,3,2) / 255.0
-    return torch.zeros([15, 3, 273, 210])# video_tensor / 255.0
-
+# Neural Network Model Definition - Copied from model_test-v3.2.py
 class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
@@ -267,8 +241,18 @@ class PoseVideoCNNRNN(nn.Module):
     def forward(self, input_data, deterministic=False):
         batch_size, seq_len = input_data.shape[0], input_data.shape[1]
 
-        # Flatten pose input: (B, T, 3, 3) -> (B, T, 9)
-        x = input_data.permute(0, 3, 1, 2).unsqueeze(1)
+        # Handle both 6D input (B, T, 6) and 3D pose input (B, T, 3, 3)
+        if len(input_data.shape) == 3:  # 6D input format (B, T, 6)
+            # Reshape 6D input to 3x3 format for processing
+            x = input_data.view(batch_size, seq_len, 2, 3)  # 6D -> (B, T, 2, 3)
+            # Pad to make it (B, T, 3, 3) for compatibility with encoder
+            padding = torch.zeros(batch_size, seq_len, 1, 3, device=input_data.device)
+            x = torch.cat([x, padding], dim=2)  # (B, T, 3, 3)
+        else:  # 3D pose input format (B, T, 3, 3)
+            x = input_data
+            
+        # Process pose input: (B, T, 3, 3) -> (B, 1, T, 3, 3)
+        x = x.permute(0, 3, 1, 2).unsqueeze(1)
         h = self.encoder(x)
 
         # Latent space
@@ -334,10 +318,10 @@ class ForwardKinematics:
                 lower = float(limit.get("lower", "0"))
                 upper = float(limit.get("upper", "0"))
                 self.joint_limits[joint_name] = (lower, upper)
-        
+
         self.selected_indices = [
-            self.all_joints.index(j) 
-            for j in self.selected_joints 
+            self.all_joints.index(j)
+            for j in self.selected_joints
             if j in self.all_joints
         ]
 
@@ -356,14 +340,14 @@ class ForwardKinematics:
         with torch.no_grad():
             zero_joints = torch.zeros(len(self.all_joints))
             fk_result = self.robot_chain.forward_kinematics(zero_joints)
-            
+
             # Precompute reference points
             shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
             forearm_pos = fk_result["right_Forearm_1"].get_matrix()[:, :3, 3]
             wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
-            
+
             # Calculate reference length
-            self.L_ref = (torch.norm(shoulder_pos - forearm_pos) + 
+            self.L_ref = (torch.norm(shoulder_pos - forearm_pos) +
                           torch.norm(wrist_pos - forearm_pos)) / 2.0
 
     def batch_forward_kinematics(self, batch_joint_values):
@@ -385,21 +369,21 @@ class ForwardKinematics:
         full_joints[:, :, self.selected_indices] = denormalized
         joints_flat = full_joints.view(-1, len(self.all_joints))
         fk_result = self.robot_chain.forward_kinematics(joints_flat)
-        
+
         # 4. Extract and normalize positions
         shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
         wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
         finger1_pos = fk_result["right_Finger_1_1"].get_matrix()[:, :3, 3]
         finger4_pos = fk_result["right_Finger_4_1"].get_matrix()[:, :3, 3]
-        
+
         normalized = torch.stack([
             (wrist_pos - shoulder_pos) / self.L_ref,
             (finger1_pos - shoulder_pos) / self.L_ref,
             (finger4_pos - shoulder_pos) / self.L_ref,
         ], dim=2).view(batch_size, seq_len, 3, 3)
-        
+
         return batch_vectors_to_6D(normalized.to(device))
-    
+
     def forward_kinematics(self, batch_joint_values):
         """
         Compute forward kinematics for a batch of joint values
@@ -427,7 +411,7 @@ class ForwardKinematics:
                 output_positions.append(self.robot_chain.forward_kinematics(full_joint_values.unsqueeze(0)))
 
         return output_positions
-    
+
     def _parse_urdf_hierarchy(self) -> Dict[str, str]:
         """
         Simplified URDF parser to get link parent-child relationships
@@ -435,17 +419,17 @@ class ForwardKinematics:
         """
         # In practice, you'd want to use a proper URDF parser here
         # This is a simplified version that might need adjustment
-        
+
         import xml.etree.ElementTree as ET
         tree = ET.parse(self.urdf_path)
         root = tree.getroot()
-        
+
         hierarchy = {}
         for joint in root.findall('joint'):
             parent = joint.find('parent').get('link')
             child = joint.find('child').get('link')
             hierarchy[child] = parent
-        
+
         return hierarchy
 
     def visualize(self, fk_result, pose, title, path):
@@ -469,7 +453,7 @@ class ForwardKinematics:
         for name, tf in fk_result.items():
             pos = tf.get_matrix()[:, :3, 3].detach().numpy()  # Extract translation component
             positions[name] = (pos - origin) / self.L_ref.detach().numpy()
-        
+
         # Draw connections based on hierarchy
         for child, parent in self.link_parents.items():
             if parent in positions and child in positions:
@@ -503,7 +487,7 @@ class ForwardKinematics:
         y = [dy + pose[3,1], dy + pose[4,1]]
         z = [dz + pose[3,2], dz + pose[4,2]]
         ax.plot(x, y, z, 'r-', linewidth=2)
-        
+
         # Set plot limits
         all_pos = np.array(list(positions.values()))
         all_pos_2 = np.array(list(pose))
@@ -511,7 +495,7 @@ class ForwardKinematics:
         ax.set_xlim([-max_range, max_range])
         ax.set_ylim([-max_range, max_range])
         ax.set_zlim([-max_range, max_range])
-        
+
         ax.set_title(title)
         ax.view_init(elev = 0, azim = 90)
         # plt.draw()
@@ -521,12 +505,12 @@ class ForwardKinematics:
         ax.view_init(elev = 90, azim = 90)
         plt.savefig(os.path.join(path, f'up {title}.png'))
 
-        # plt.pause(0.3)
-    
+        plt.close('all')
+
     def animate_movement(self, batch_joint_values, pose, path):
         """
         Animate a sequence of joint angle configurations
-        
+
         Args:
             joint_angle_sequence: List of dictionaries containing joint angles
         """
@@ -562,7 +546,7 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
 def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, single=False):
     """
     Computes the loss between the predicted and actual pose data (no FK needed)
-    
+
     Args:
         pose_data: Ground truth pose data [batch, 15, 3, 3]
         model_output: Model predictions [batch, 15, 6] => directly output from network in 6D form
@@ -570,7 +554,7 @@ def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7
         lambda_kl: Weight for KL divergence loss
         lambda_vel: Weight for velocity loss
         eps: Small epsilon value to prevent division by zero
-        
+
     Returns:
         Tuple of total loss and individual loss components
     """
@@ -579,9 +563,9 @@ def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7
     # pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
     # pose_loss = mse_loss(model_output, pose_data)
     #errors = torch.abs(model_output - pose_data)
-    
+
     # Convert pose_data to 6D representation
-    kine_output = fk.batch_forward_kinematics(model_output)  
+    kine_output = fk.batch_forward_kinematics(model_output)
     # calculate position loss using 6d representation
     errors = torch.abs(kine_output - pose_data)
     max_per_joint, _ = torch.max(
@@ -592,73 +576,152 @@ def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7
 
     return pose_loss
 
-def test_model(sample_path, urdf_path, model_path, output_path):
+def _load_pose_chunks(pb_path):
     """
-    Test the neural network model
-    """
-
-    model = PoseVideoCNNRNN().to(device)
-    model.load_state_dict(torch.load(model_path, weights_only=True))
-    model.eval()
-
-    fk = ForwardKinematics(urdf_path)
-
-    f = open(os.path.join(output_path, "results.log"), 'w')
-
-    for sample in sample_path:
-        pose, viz = _load_protobuf(sample+".pb")
-        pose = pose.unsqueeze(0).to(device)
-        viz = viz.unsqueeze(0).to(device)
-        
-        # Forward pass through the model to get 6D representation
-        model_output, _, _ = model(pose, deterministic=True)
-
-        f.write("------ "+sample+" ------\n")
-        print("------ "+sample+" ------\n")
-        
-        for i in range(15):
-            pose_loss = loss_fn(fk, pose[:,i].unsqueeze(0), model_output[:,i].unsqueeze(0), single=True)
-            f.write(f"- frame {i} Pose Loss: {pose_loss:.5f}\n")
-        
-        pose_loss = loss_fn(fk, pose[:,:], model_output)
-        f.write(f"\nPose Loss: {pose_loss:.5f}\n")
-        print(f"\nPose Loss: {pose_loss:.5f}\n")
-
-        path = os.path.join(output_path,"fig",sample.split("/")[-1])
-        if os.path.exists(path):
-            for filename in os.listdir(path):
-                file_path = os.path.join(path, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
-        else:
-            os.makedirs(path)
-        fk.animate_movement(model_output, viz.cpu(), path)
-
-    # print("zipping...")
-    # shutil.make_archive(output_path, 'zip', os.path.dirname(output_path) )
-
-def main():
-    """Main function to parse arguments and run the training or testing process"""
+    Load and process pose data in overlapping 15-frame chunks.
     
-    samples = ["/home/cedra/psl_project/5_dataset/IRIB2_105_23513_117-131_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_44_7637_196-210_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_105_23513_1679-1693_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_111_6667_1214-1228_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_117_22098_832-846_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_48_13327_842-856_left"]
+    Args:
+        pb_path (str): Path to the protobuf file
+        
+    Returns:
+        List[torch.Tensor]: List of pose chunks with shape [15, 6]
+    """
+    pose_full, viz_full = _load_protobuf(pb_path)
+    T = pose_full.shape[0]
+    chunks = []
+    
+    # Create overlapping chunks: 0-14, 1-15, 2-16, etc.
+    for start_frame in range(T - 14):  # Ensure we have at least 15 frames
+        end_frame = start_frame + 15
+        chunk = pose_full[start_frame:end_frame]
+        
+        # Add chunk if it has exactly 15 frames
+        if chunk.shape[0] == 15:
+            chunks.append(chunk)
+    
+    # Handle case where pose data has less than 15 frames
+    if T < 15:
+        print(f"Low frame count {pb_path}: {T} frames")
+        padding = torch.zeros([15 - T, 6]).to(device)
+        padded_pose = torch.cat((pose_full, padding), dim=0)
+        chunks.append(padded_pose)
+    
+    return chunks, viz_full
 
-    model_path = "/home/cedra/psl_project/results/final2/sign_language_pose_model_v3.2_100.pth"
+def test_model_pose(pose_dir, urdf_path, model_path, output_path):
+    """
+    Test the neural network model using pose data input
+    """
+    with torch.no_grad():
+        model = PoseVideoCNNRNN().to(device)
+        model.load_state_dict(torch.load(model_path, weights_only=True))
+        model.eval()
+        
+        fk = ForwardKinematics(urdf_path)
+        
+        if isinstance(pose_dir, str) and os.path.isdir(pose_dir):
+            pb_files = glob.glob(os.path.join(pose_dir, "*.pb"))
+            pose_dir = [f[:-3] for f in pb_files]
+        else:
+            print("Invalid directory")
+            return False
+        
+        f = open(os.path.join(output_path, "results.log"), 'w')
+        
+        for pose_base_path in pose_dir:
+            pose_name = os.path.basename(pose_base_path)
+            
+            print(f"Processing pose data: {pose_name}")
+            f.write(f"====== {pose_name} ======\n")
+            
+            pb_file = pose_base_path + ".pb"
+            if not os.path.exists(pb_file):
+                print(f"PB file not found!")
+                f.write(f"PB file not found!")
+                continue
+            
+            # Load pose chunks and visualization data
+            pose_chunks, viz_full = _load_pose_chunks(pb_file)
+            pose_full, _ = _load_protobuf(pb_file)  # Also load full pose data for ground truth
 
-    urdf_path="/home/cedra/psl_project/rasa/hand.urdf"
+            # Create Hamming window for weighted aggregation
+            window = torch.hamming_window(15, periodic=False, device=device)
+            window = window.view(1, 15, 1)  # Shape: [1, 15, 1] for broadcasting
 
-    output_path="/home/cedra/psl_project/model_test"
-
-    test_model(
-        sample_path=samples,
-        model_path=model_path,
-        urdf_path=urdf_path,
-        output_path=output_path
-    )
+            # Initialize accumulation buffers for overlapping window aggregation
+            T = pose_full.shape[0]
+            full_output = torch.zeros(T, 6, device=device)
+            full_weights = torch.zeros(T, device=device)
+            frame_indices = torch.arange(T, device=device)
+            
+            # Process each pose chunk with overlapping windows
+            for chunk_idx, pose_chunk in enumerate(pose_chunks):
+                start_frame = chunk_idx
+                end_frame = chunk_idx + 15  # 15 frames total (0-14)
+                
+                # Prepare pose tensor input for model
+                pose_input = pose_chunk.unsqueeze(0).to(device)  # Add batch dimension
+                
+                # Forward pass through the model with deterministic inference
+                model_output, _, _ = model(pose_input, deterministic=True)
+                
+                # Apply Hamming window weighting for smooth aggregation
+                weighted_output = model_output.squeeze(0) * window.squeeze(0)  # Remove batch dim and apply window
+                
+                # Accumulate weighted results for overlapping regions
+                chunk_mask = (frame_indices >= start_frame) & (frame_indices < end_frame)
+                full_output[chunk_mask] += weighted_output
+                full_weights[chunk_mask] += window.squeeze()
+                
+                # Calculate and log chunk-specific loss
+                chunk_pose_loss = loss_fn(fk, pose_input, model_output)
+                
+                chunk_name = f"{pose_name}_{start_frame}_{end_frame-1}"
+                f.write(f"Chunk {chunk_name}: Pose Loss: {chunk_pose_loss:.5f}\n")
+                # print(f"Chunk {chunk_name}: Pose Loss: {chunk_pose_loss:.5f}")
+            
+            # Normalize accumulated output by weights to handle overlapping regions
+            full_weights = torch.clamp(full_weights, min=1e-8)  # Prevent division by zero
+            final_output = full_output / full_weights.unsqueeze(1)
+            
+            # Calculate total aggregated loss using final output
+            pose_loss = loss_fn(fk, pose_full.unsqueeze(0), final_output.unsqueeze(0))
+            
+            print(f"Total Pose Loss: {pose_loss.item():.6f}")
+            f.write(f"Total Pose Loss: {pose_loss.item():.6f}\n")
+            
+            # Create output directory for visualizations
+            output_dir = os.path.join(output_path, pose_name)
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Generate visualizations using final aggregated output
+            fk.animate_movement(final_output.unsqueeze(0), viz_full.unsqueeze(0), output_dir)
+            
+        f.close()
+        print("Testing completed!")
 
 if __name__ == "__main__":
-    main()
+
+    parser = argparse.ArgumentParser(description="Test pose-based sign language recognition model")
+    parser.add_argument("--pose_dir", type=str, required=False, help="Directory containing pose protobuf files")
+    parser.add_argument("--urdf_path", type=str, required=False, help="Path to URDF file")
+    parser.add_argument("--model_name", type=str, required=False, help="Name of trained model")
+    parser.add_argument("--output_path", type=str, required=False, help="Output directory for results")
+    
+    args = parser.parse_args()
+
+    name = args.model_name if args.model_name is not None else "1_best"
+    model_path = "/home/cedra/psl_project/results/final2/sign_language_pose_model_v3.2_"+name+".pth"
+
+    urdf_path = args.urdf_path if args.urdf_path is not None else "/home/cedra/psl_project/rasa/hand.urdf"
+    output_path = args.output_path if args.output_path is not None else "/home/cedra/psl_project/full_test/fig/"
+    
+    if not args.pose_dir:
+        pose_dir = "/home/cedra/psl_project/clips/"
+    else:
+        pose_dir = args.pose_dir
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_path, exist_ok=True)
+    
+    test_model_pose(pose_dir, urdf_path, model_path, output_path)

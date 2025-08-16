@@ -207,7 +207,7 @@ class PoseVideoDataset(Dataset):
         # Load pose data from protobuf
         pose_data = self._load_protobuf(pb_path)
 
-        sample = {"video": video_data, "pose": pose_data}
+        sample = {"name": video_path, "video": video_data, "pose": pose_data}
 
         if self.transform:
             sample = self.transform(sample)
@@ -275,7 +275,7 @@ class PoseVideoDataset(Dataset):
         elif num_frames > 15:
             pose_tensor = pose_tensor[:15, :, :]
 
-        return pose_tensor
+        return batch_vectors_to_6D(pose_tensor)
 
 
 # Neural Network Model Definition
@@ -315,6 +315,12 @@ class PoseVideoCNNRNN(nn.Module):
             nn.ReLU(),
             nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
         )
+        
+        # transform 3x3 representation to 6d representation
+        self.fc_output = nn.Sequential(
+            nn.Linear(15 * 3 * 3, 15 * 6),
+            nn.Sigmoid()
+        )
 
     def forward(self, input_data, deterministic=False):
         batch_size, seq_len = input_data.shape[0], input_data.shape[1]
@@ -336,8 +342,13 @@ class PoseVideoCNNRNN(nn.Module):
         h = self.fc_decode(embedding)
         output = self.decoder(h)
         output = output.squeeze(1)
+        
+        # transform to 6D representation
+        output_flat = output.view(batch_size, -1)  # (B, 135)
+        output_6d = self.fc_output(output_flat)  # (B, 90)
+        output_6d = output_6d.view(batch_size, 15, 6)  # (B, 15, 6)
 
-        return output, mu, logvar
+        return output_6d, mu, logvar
 
 
 class ForwardKinematics:
@@ -403,7 +414,7 @@ class ForwardKinematics:
             fk_result = self.robot_chain.forward_kinematics(zero_joints)
             
             # Precompute reference points
-            shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+            shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
             forearm_pos = fk_result["right_Forearm_1"].get_matrix()[:, :3, 3]
             wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
             
@@ -432,7 +443,7 @@ class ForwardKinematics:
         fk_result = self.robot_chain.forward_kinematics(joints_flat)
         
         # 4. Extract and normalize positions
-        shoulder_pos = fk_result["right_Shoulder_2"].get_matrix()[:, :3, 3]
+        shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
         wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
         finger1_pos = fk_result["right_Finger_1_1"].get_matrix()[:, :3, 3]
         finger4_pos = fk_result["right_Finger_4_1"].get_matrix()[:, :3, 3]
@@ -443,7 +454,7 @@ class ForwardKinematics:
             (finger4_pos - shoulder_pos) / self.L_ref,
         ], dim=2).view(batch_size, seq_len, 3, 3)
         
-        return normalized.to(device)
+        return batch_vectors_to_6D(normalized.to(device))
 
 def test_dataset(data_dir):
     """
@@ -555,21 +566,16 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
     
     # Stack u and v_ortho to form 6D representation
-    six_d = torch.cat([u, v_ortho], dim=-1)
+    six_d = torch.stack([root, root+0.2*u, root+0.2*v_ortho], dim=-1)
     return six_d
- #import torch
-import torch.nn.functional as F
-from torch.nn import MSELoss
 
-mse_loss = MSELoss()
-
-def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
+def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_max=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
     """
     Computes the loss between the predicted and actual pose data (no FK needed)
     
     Args:
         pose_data: Ground truth pose data [batch, 15, 3, 3]
-        model_output: Model predictions [batch, 15, 3, 3] => directly output from network
+        model_output: Model predictions [batch, 15, 6] => directly output from network in 6D form
         logvar: Log variance from the model
         mu: Mean from the model
         lambda_R: Weight for rotation loss
@@ -580,35 +586,24 @@ def loss_fn(pose_data, model_output, logvar, mu, lambda_R=1.0, lambda_kl=0.1, la
     Returns:
         Tuple of total loss and individual loss components
     """
-    # Position loss (e.g., difference in palm position)
-    #  may select specific joints or axes; here we use the 1st vector of rotation matrix
-    # pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
-    # pose_loss = mse_loss(model_output, pose_data)
-    errors = torch.abs(model_output - pose_data)
+    kine_output = fk.batch_forward_kinematics(model_output)
+
+    # calculate position loss using 6d representation
+    pose_loss = 0#mse_loss(kine_output, pose_data)
+    errors = torch.abs(kine_output - pose_data)
     max_per_joint, _ = torch.max(
-            errors.view(errors.size(0), errors.size(1), errors.size(2), -1),
+            errors.view(errors.size(0), errors.size(1), -1),
             dim=1  # Reduce across frames and coordinates
         )
-    pose_loss = torch.mean(max_per_joint)
+    max_loss = torch.mean(max_per_joint)
 
     # KL divergence loss for VAE regularization
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
-    # Rotation loss in 6D representation
-    # input_6d = batch_vectors_to_6D(pose_data, eps=eps)
-    # output_6d = batch_vectors_to_6D(model_output, eps=eps)
-    # R_loss = torch.mean((output_6d - input_6d) ** 2)
-
-    # Velocity loss based on movement of first vector of rotation matrix (e.g., palm position)
-    # velocity_in = torch.diff(pose_data, dim=1)  # [batch, 14, 3]
-    # velocity_out = torch.diff(model_output, dim=1)  # [batch, 14, 3]
-    # dir_loss = 1.0 - F.cosine_similarity(velocity_in, velocity_out, dim=-1).mean()
-    # vel_loss = 30.0 * mse_loss(velocity_in, velocity_out)
-
     # Combine all loss terms
-    loss = pose_loss + lambda_kl * kl_loss #+ lambda_R * R_loss + lambda_vel * (vel_loss + 0.5*dir_loss)
+    loss = pose_loss + lambda_kl * kl_loss + lambda_max * max_loss
 
-    return loss, pose_loss, 0, kl_loss, 0, 0#loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss
+    return loss, pose_loss, max_loss, kl_loss
 
 def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0.5):
     """Linear warmup for velocity loss coefficient"""
@@ -621,7 +616,7 @@ def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0
     else:
         return final_value
 
-def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0.001):
+def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.001):
     """
     Train the neural network model
 
@@ -642,7 +637,7 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
 
     # Create dataset with validation to filter out corrupted videos
     dataset = PoseVideoDataset(root_dir=data_dir, validate_files=False)
-    # test_dataset = PoseVideoDataset(root_dir=test_dir, validate_files=False)
+    test_dataset = PoseVideoDataset(root_dir=test_dir, validate_files=False)
     
     if len(dataset) == 0:
         print("No valid videos found in the dataset. Please check your data files.")
@@ -657,21 +652,20 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
     # Split dataset into train and test sets
     train_size = int(0.8 * len(dataset))
     eval_size = int(0.2 * len(dataset))
-    test_size = 0 # int(0.15 * len(dataset))
-    e = len(dataset) - train_size - eval_size - test_size
-    train_dataset, eval_dataset, test_dataset, _ = random_split(dataset, [train_size, eval_size, test_size, e])
+    e = len(dataset) - train_size - eval_size
+    train_dataset, eval_dataset, _ = random_split(dataset, [train_size, eval_size, e])
 
-    for i in random.sample(train_dataset.indices, 2):
-        print(dataset.video_files[i])
-    for i in random.sample(eval_dataset.indices, 2):
-        print(dataset.video_files[i])
+    # for i in random.sample(train_dataset.indices, 2):
+    #     print(dataset.video_files[i])
+    # for i in random.sample(eval_dataset.indices, 2):
+    #     print(dataset.video_files[i])
     # for i in random.sample(test_dataset.indices, 2):
     #     print(dataset.video_files[i])
 
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
-    # test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     print(f"Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}, Test size: {len(test_dataset)}")
 
@@ -705,7 +699,7 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
 
 
     # Initialize forward kinematics
-    #fk = ForwardKinematics(urdf_path)
+    fk = ForwardKinematics(urdf_path)
     
     # Import tqdm for progress bars
     from tqdm import tqdm
@@ -726,10 +720,8 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
         model.train()  # Set model to training mode
         total_loss = 0
         total_pose_loss = 0
-        total_R_loss = 0
+        total_max_loss = 0
         total_kl_loss = 0
-        total_vel_loss = 0
-        total_dir_loss = 0
 
         # Create progress bar for batches
         batch_pbar = tqdm(
@@ -740,9 +732,8 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
             total=len(train_loader)
         )
 
-        lambda_kl = 0.1 * (1 - min(0.9, 0.005 * (epoch+1)))
-        lambda_R = lambda_scheduler(epoch, warmup_start=10, warmup_end=20, final_value=1.0)
-        lambda_vel = lambda_scheduler(epoch, warmup_start=5, warmup_end=45, final_value=30)
+        lambda_kl = lambda_scheduler(epoch, warmup_start=5, warmup_end=15, final_value=0.1)#0.1 * (min(1, 0.005 * (epoch+1)))
+        lambda_max = 1.0#lambda_scheduler(epoch, warmup_start=5, warmup_end=15, final_value=1.0)
 
         for i, batch in enumerate(batch_pbar):
             # video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
@@ -753,7 +744,7 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
             model_output, mu, logvar = model(pose_data)  # Output: [batch, 15, 6] (predicted)
 
             # Compute loss
-            loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn(pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
@@ -762,44 +753,34 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
 
             # Update running loss
             loss_val = loss.item()
-            pose_loss_val = pose_loss.item()
-            R_loss_val = 0#R_loss.item()
+            pose_loss_val = 0#pose_loss.item()
+            max_loss_val = max_loss.item()
             kl_loss_val = kl_loss.item()
-            vel_loss_val = 0#vel_loss.item()
-            dir_loss_val = 0#dir_loss.item()
             
             total_loss += loss_val
             total_pose_loss += pose_loss_val
-            total_R_loss += R_loss_val
+            total_max_loss += max_loss_val
             total_kl_loss += kl_loss_val
-            total_vel_loss += vel_loss_val
-            total_dir_loss += dir_loss_val
             
             # Update progress bar with current loss
             batch_pbar.set_postfix({
                 'loss': f'{loss_val:.2f}', 
                 'pose_loss': f'{pose_loss_val:.2f}', 
-                'R_loss': f'{R_loss_val:.2f}', 
-                'kl_loss': f'{kl_loss_val:.2f}', 
-                'vel_loss': f'{vel_loss_val:.2f}', 
-                'dir_loss': f'{dir_loss_val:.2f}'
+                'max_loss': f'{max_loss_val:.2f}', 
+                'kl_loss': f'{kl_loss_val:.2f}'
             })
         
         total_loss /= len(train_loader)
         total_pose_loss /= len(train_loader)
-        total_R_loss /= len(train_loader)
+        total_max_loss /= len(train_loader)
         total_kl_loss /= len(train_loader)
-        total_vel_loss /= len(train_loader)
-        total_dir_loss /= len(train_loader)
 
         # Evaluation
         model.eval()  # Set model to evaluation mode
         eval_loss = 0
         eval_pose_loss = 0
-        eval_R_loss = 0
+        eval_max_loss = 0
         eval_kl_loss = 0
-        eval_vel_loss = 0
-        eval_dir_loss = 0
     
         # Progress bar for test batches
         eval_pbar = tqdm(
@@ -819,37 +800,29 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
                 model_output, mu, logvar = model(pose_data)
 
                 # Compute loss
-                loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+                loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
                 
                 loss_val = loss
                 pose_loss_val = pose_loss
-                R_loss_val = R_loss
+                max_loss_val = max_loss
                 kl_loss_val = kl_loss
-                vel_loss_val = vel_loss
-                dir_loss_val = dir_loss
 
                 eval_loss += loss_val
                 eval_pose_loss += pose_loss_val
-                eval_R_loss += R_loss_val
+                eval_max_loss += max_loss_val
                 eval_kl_loss += kl_loss_val
-                eval_vel_loss += vel_loss_val
-                eval_dir_loss += dir_loss_val
 
                 # Update progress bar
                 eval_pbar.set_postfix({
                     'loss': f'{loss_val:.2f}', 
                     'pose_loss': f'{pose_loss_val:.2f}', 
-                    'R_loss': f'{R_loss_val:.2f}', 
-                    'kl_loss': f'{kl_loss_val:.2f}', 
-                    'vel_loss': f'{vel_loss_val:.2f}', 
-                    'dir_loss': f'{dir_loss_val:.2f}'
+                    'max_loss': f'{max_loss_val:.2f}', 
+                    'kl_loss': f'{kl_loss_val:.2f}'
                 })
         eval_loss /= len(eval_loader)
         eval_pose_loss /= len(eval_loader)
-        eval_R_loss /= len(eval_loader)
+        eval_max_loss /= len(eval_loader)
         eval_kl_loss /= len(eval_loader)
-        eval_vel_loss /= len(eval_loader)
-        eval_dir_loss /= len(eval_loader)
 
         scheduler.step(eval_loss)
 
@@ -858,10 +831,10 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
             overfit = 0
             best_eval_loss = eval_loss
             # Save the trained model
-            torch.save(model.state_dict(), f"sign_language_pose_model_v3.1_{epoch+1}_best.pth")
+            torch.save(model.state_dict(), f"sign_language_pose_model_v3.2_{epoch+1}_best.pth")
         else:
             overfit += 1
-            torch.save(model.state_dict(), f"sign_language_pose_model_v3.1_{epoch+1}.pth")
+            torch.save(model.state_dict(), f"sign_language_pose_model_v3.2_{epoch+1}.pth")
             # if(overfit > 5):
             #     break
 
@@ -876,57 +849,74 @@ def train_model(data_dir, test_dir, num_epochs=10, batch_size=8, learning_rate=0
 
         # Print epoch summary
         print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s\n" 
-              f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, R Loss: {total_R_loss:.5f}, "
-              f"KL Loss: {total_kl_loss:.5f}, Vel Loss: {total_vel_loss:.5f}, dir Loss: {total_dir_loss:.5f}\n"
-              f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, R Loss: {eval_R_loss:.5f}, "
-              f"KL Loss: {eval_kl_loss:.5f}, Vel Loss: {eval_vel_loss:.5f}, dir Loss: {eval_dir_loss:.5f}")
+              f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, max Loss: {total_max_loss:.5f}, "
+              f"KL Loss: {total_kl_loss:.5f}\n"#, Vel Loss: {total_vel_loss:.5f}, dir Loss: {total_dir_loss:.5f}\n"
+              f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, max Loss: {eval_max_loss:.5f}, "
+              f"KL Loss: {eval_kl_loss:.5f}")#, Vel Loss: {eval_vel_loss:.5f}, dir Loss: {eval_dir_loss:.5f}")
         
     print(f"\nTraining completed in {num_epochs} epochs")
 
-    # # Evaluation on test data
-    # print("\nEvaluating model on test data...")
-    # model.eval()  # Set model to evaluation mode
-    # test_loss = 0
-    # test_pose_loss = 0
-    # test_R_loss = 0
-    # test_kl_loss = 0
-    # test_vel_loss = 0
-    # test_dir_loss = 0
-    
-    # # Progress bar for test batches
-    # test_pbar = tqdm(
-    #     test_loader, 
-    #     desc="Testing", 
-    #     total=len(test_loader)
-    # )
+    # Evaluation on test data
+    # model.load_state_dict(torch.load("/home/cedra/psl_project/sign_language_pose_model_v3.2_100.pth", weights_only=True))
+    print("\nEvaluating model on test data...")
+    model.eval()  # Set model to evaluation mode
+    test_loss = 0
+    test_pose_loss = 0
+    test_max_loss = 0
+    test_kl_loss = 0
 
-    # with torch.no_grad():  # No gradient computation
-    #     for i, batch in enumerate(test_pbar):
-    #         # video_data = batch["video"]
-    #         pose_data = batch["pose"]
+    # Progress bar for test batches
+    test_pbar = tqdm(
+        test_loader, 
+        desc="testing", 
+        total=len(test_loader),
+        leave=False, 
+        position=1,
+    )
 
-    #         # Forward pass with pose data as input instead of video
-    #         model_output, mu, logvar = model(pose_data)
+    lambda_kl = 0.1
+    lambda_max = 1.0
+
+    with torch.no_grad():  # No gradient computation
+        f = open("test.log", 'w')
+        for i, batch in enumerate(test_pbar):
+            # video_data = batch["video"]
+            pose_data = batch["pose"]
+
+            # Forward pass with pose data as input instead of video
+            model_output, mu, logvar = model(pose_data)
+
+            # Compute loss
+            loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
             
-    #         # Compute Loss
-    #         loss, pose_loss, R_loss, kl_loss, vel_loss, dir_loss = loss_fn( pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_vel=lambda_vel, lambda_R=lambda_R)
+            loss_val = loss
+            pose_loss_val = pose_loss
+            max_loss_val = max_loss
+            kl_loss_val = kl_loss
 
-    #         test_loss += loss
-    #         test_pose_loss += pose_loss
-    #         test_R_loss += R_loss
-    #         test_kl_loss += kl_loss
-    #         test_vel_loss += vel_loss
-    #         test_dir_loss += dir_loss
+            f.write(str(batch["name"][0])+","+str(loss_val)+","+str(pose_loss_val)+","+str(max_loss_val)+","+str(kl_loss_val)+"\n")
 
-    # test_loss /= len(test_loader)
-    # test_pose_loss /= len(test_loader)
-    # test_R_loss /= len(test_loader)
-    # test_kl_loss /= len(test_loader)
-    # test_vel_loss /= len(test_loader)
-    # test_dir_loss /= len(test_loader)
+            test_loss += loss_val
+            test_pose_loss += pose_loss_val
+            test_max_loss += max_loss_val
+            test_kl_loss += kl_loss_val
 
-    # print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, R Loss: {test_R_loss:.5f}, "
-    #       f"KL Loss: {test_kl_loss:.5f}, Vel Loss: {test_vel_loss:.5f}, dir Loss: {test_dir_loss:.5f}")
+            # Update progress bar
+            test_pbar.set_postfix({
+                'loss': f'{loss_val:.2f}', 
+                'pose_loss': f'{pose_loss_val:.2f}', 
+                'max_loss': f'{max_loss_val:.2f}', 
+                'kl_loss': f'{kl_loss_val:.2f}', 
+                # 'vel_loss': f'{vel_loss_val:.2f}', 
+                # 'dir_loss': f'{dir_loss_val:.2f}'
+            })
+    test_loss /= len(test_loader)
+    test_pose_loss /= len(test_loader)
+    test_max_loss /= len(test_loader)
+    test_kl_loss /= len(test_loader)
+
+    print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, max Loss: {test_max_loss:.5f}, "
+          f"KL Loss: {test_kl_loss:.5f}")
 
 def main():
     """Main function to parse arguments and run the training or testing process"""
@@ -936,7 +926,7 @@ def main():
     TEST_DATA_DIR = "/home/cedra/psl_project/5_dataset/test"
     DEFAULT_URDF_PATH = "/home/cedra/psl_project/rasa/hand.urdf"
     DEFAULT_NUM_EPOCHS = 100
-    DEFAULT_BATCH_SIZE = 16
+    DEFAULT_BATCH_SIZE = 64
     DEFAULT_TEST_ONLY = False
     DEFAULT_EXTRACT_ZIP = None
 
@@ -1004,7 +994,7 @@ def main():
         train_model(
             data_dir=data_dir,
             test_dir=test_dir,
-            
+            urdf_path=urdf_path,
             num_epochs=num_epochs,
             batch_size=batch_size,
         )

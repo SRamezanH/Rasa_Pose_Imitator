@@ -19,6 +19,7 @@ import numpy as np
 import pytorch_kinematics as pk
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import torchvision.models.video as models
 from mpl_toolkits.mplot3d import Axes3D
 from typing import Dict, List
 import torch
@@ -71,7 +72,7 @@ if _descriptor._USE_C_DESCRIPTORS == False:
 this_module = sys.modules[__name__]
 pose_data_pb2 = this_module
 sys.modules["pose_data_pb2"] = this_module
-    
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Module for processing protobuf data
@@ -111,7 +112,7 @@ class ProtobufProcessor:
         """Normalize body landmarks using shoulders as reference points"""
         if landmarks.shape[0] < 10:
             return torch.zeros((1, 3, 3))  # Return zero if less than 2 landmarks
-        
+
         origin = landmarks[1].clone().detach()
         # Compute the distance between the shoulder and elbow as the scale factor
         L = (torch.linalg.vector_norm(landmarks[1] - landmarks[3]) + torch.linalg.vector_norm(landmarks[3] - landmarks[5])).clone().detach()/2.0
@@ -122,20 +123,20 @@ class ProtobufProcessor:
             origin = landmarks[0].clone().detach()
             # Compute the distance between the shoulder and elbow as the scale factor
             L = (torch.linalg.vector_norm(landmarks[0] - landmarks[2]) + torch.linalg.vector_norm(landmarks[4] - landmarks[2])).clone().detach()/2.0
-        
+
         L = L if L > 0 else 1.0  # Prevent division by zero
 
         landmarks = (landmarks - origin) / L # Wrist as reference
 
         # Normalize hand landmarks
         return landmarks[indices].unsqueeze(0)
-    
+
     @staticmethod
     def normalize_body_landmarks_for_viz(landmarks, left_side):
         """Normalize body landmarks using shoulders as reference points"""
         if landmarks.shape[0] < 10:
             return torch.zeros((1, 5, 3))  # Return zero if less than 2 landmarks
-        
+
         origin = landmarks[1].clone().detach()
         # Compute the distance between the shoulder and elbow as the scale factor
         L = (torch.linalg.vector_norm(landmarks[1] - landmarks[3]) + torch.linalg.vector_norm(landmarks[3] - landmarks[5])).clone().detach()/2.0
@@ -146,7 +147,7 @@ class ProtobufProcessor:
             origin = landmarks[0].clone().detach()
             # Compute the distance between the shoulder and elbow as the scale factor
             L = (torch.linalg.vector_norm(landmarks[0] - landmarks[2]) + torch.linalg.vector_norm(landmarks[4] - landmarks[2])).clone().detach()/2.0
-        
+
         L = L if L > 0 else 1.0  # Prevent division by zero
 
         landmarks = (landmarks - origin) / L # Wrist as reference
@@ -176,7 +177,7 @@ def _load_protobuf(pb_path):
         pose_landmarks = ProtobufProcessor.extract_landmark_coordinates(
             frame, "pose_landmarks", range(10)
         )  # Body landmarks
-        
+
         # Normalize the extracted landmarks
         # selected_landmarks, h = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
         selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
@@ -194,102 +195,193 @@ def _load_protobuf(pb_path):
         print("Low frame count" + pb_path)
         padding = torch.zeros([15 - num_frames, feature_size, dim_size ]).to(device)
         pose_tensor = torch.cat((pose_tensor, padding), dim=0)
-    elif num_frames > 15:
-        pose_tensor = pose_tensor[:15, :, :]
 
     return batch_vectors_to_6D(pose_tensor), viz_tensor
 
-def _load_video(self, video_path):
+# def _load_video(video_path):
+#     """
+#     Load and process video frames using OpenCV.
+
+#     Args:
+#         video_path (string): Path to the video file
+
+#     Returns:
+#         torch.Tensor: Tensor containing video frames with shape  [15, 3, 273, 210]
+#     """
+#     # Open the video file
+#     video, _, _ = read_video(video_path ,output_format="TCHW")
+#     video_tensor = video.to(device)
+#     video_tensor = video_tensor[:15, :3, :210, :273]
+#     num_frames, ch, h, w = video_tensor.shape
+#     if num_frames < 15:
+#         print("Low frame count" + video_path)
+#         padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
+#         video_tensor = torch.cat((video_tensor, padding), dim=0)
+
+#     return video_tensor.permute(0,1,3,2) / 255.0
+
+
+def _load_video_chunks(video_path):
     """
-    Load and process video frames using OpenCV.
-
-    Args:
-        video_path (string): Path to the video file
-
-    Returns:
-        torch.Tensor: Tensor containing video frames with shape  [15, 3, 273, 210]
+    load and process video frames (overlapping 15-frame chunks eg. 1...15 , 2...16 and so on).
+    returjn:
+        List[torch.Tensor]: List of tensors containing video chunks with shape [15, 3, 273, 210]
     """
-    # Open the video file
-    # video, _, _ = read_video(video_path ,output_format="TCHW")
-    # video_tensor = video.to(device)
-    # video_tensor = video_tensor[:15, :3, :210, :273]
-    # num_frames, ch, h, w = video_tensor.shape
-    # if num_frames < 15:
-    #     print("Low frame count" + video_path)
-    #     padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
-    #     video_tensor = torch.cat((video_tensor, padding), dim=0)
+    video, _, _ = read_video(video_path, output_format="TCHW")
+    video_tensor = video.to(device)
+    video_tensor = video_tensor[1:, :3, :210, :273]
+    num_frames, ch, h, w = video_tensor.shape
 
-    #return video_tensor.permute(0,1,3,2) / 255.0
-    return torch.zeros([15, 3, 273, 210])# video_tensor / 255.0
+    chunks = []
 
+    #overlapping chunks: 1-15, 2-16, 3-17, etc.
+    for start_frame in range(num_frames - 14):  # check if we have at least 15 frames
+        end_frame = start_frame + 15 
+        chunk = video_tensor[start_frame:end_frame]
+
+        # if chunk has exactly 15 frames add it
+        if chunk.shape[0] == 15:
+            chunks.append(chunk.permute(0,1,3,2) / 255.0)
+
+    # handle case where video has less than 15 frames
+    if num_frames < 15:
+        print(f"Low frame count {video_path}: {num_frames} frames")
+        padding = torch.zeros([15 - num_frames, ch, h, w]).to(device)
+        padded_video = torch.cat((video_tensor, padding), dim=0) 
+        chunks.append(padded_video.permute(0,1,3,2) / 255.0)
+    
+    return chunks
+
+class Adapter3D(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.down = nn.Conv3d(channels, channels//reduction, kernel_size=1, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.up   = nn.Conv3d(channels//reduction, channels,     kernel_size=1, bias=False)
+    def forward(self, x):
+        return x + self.up(self.relu(self.down(x)))
+
+# Neural Network Model Definition
 class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
+        
+        # Backbone (frozen R3D-18)
+        r3d = models.r3d_18(pretrained=True)
+        for p in r3d.parameters():
+            p.requires_grad = False
 
-        # Temporal RNN (LSTM)
-        self.encoder = nn.Sequential(
-            nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # (8, 15, 3, 3)
-            nn.ReLU(),
-            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1), # (16, 8, 2, 2)
-            nn.ReLU(),
-            nn.Flatten()
+        self.backbone = nn.Sequential(*list(r3d.children())[:-2])
+
+        # 2. Freeze all weights
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        # 3. Inject adapters into the *last* block of layer4
+        layer4   = self.backbone[4]       # nn.Sequential of BasicBlocks
+        last_blk = layer4[-1]        # the very last BasicBlock
+
+        # 4. Find its conv2 and channel count
+        conv2 = last_blk.conv2
+        if isinstance(conv2, nn.Sequential):
+            conv_layer = next(m for m in conv2 if isinstance(m, nn.Conv3d))
+        else:
+            conv_layer = conv2
+        C_out = conv_layer.weight.shape[0]
+
+        # 5. Create & attach adapter
+        adapter = Adapter3D(C_out, reduction=16)
+        last_blk.adapter = adapter
+
+        # 6. Monkey-patch forward
+        orig_fwd = last_blk.forward
+        def new_forward(x, orig_fwd=orig_fwd, adapter=adapter):
+            out = orig_fwd(x)
+            return adapter(out)
+        last_blk.forward = new_forward
+        
+        # Enhanced feature adapter (more channels + extra layer)
+        self.feature_adapter = nn.Sequential(
+            nn.Conv3d(512, 512, kernel_size=1),  # Increased channels
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.AdaptiveAvgPool3d((1, 1, 1)),
+            nn.Flatten(),
+            nn.Linear(512, 1024),  # Expanded layer
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Linear(1024, 512),  # Additional layer
+            nn.LeakyReLU(0.1, inplace=True)
         )
 
-        # Latent space
+        # Preserved latent space layers (unchanged)
         self.fc_mu = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(16*8*2*2, 16),
+            nn.Linear(512, 16),
             nn.LeakyReLU(0.1),
         )
-
         self.fc_logvar = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(16*8*2*2, 16),
+            nn.Linear(512, 16),
             nn.LeakyReLU(0.1),
         )
-
-        # Decoder parameters
         self.fc_decode = nn.Linear(16, 16 * 8 * 2 * 2)
-
+        
+        # Enhanced decoder (more channels + extra layer)
         self.decoder = nn.Sequential(
             nn.Unflatten(1, (16, 8, 2, 2)),
-            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1),# output_padding=(1,1,1)),
+            nn.ConvTranspose3d(16, 128, kernel_size=3, stride=2, padding=1),  # Increased channels
             nn.ReLU(),
-            nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
+            nn.ConvTranspose3d(128, 64, kernel_size=3, stride=1, padding=1),   # New layer
+            nn.ReLU(),
+            nn.ConvTranspose3d(64, 32, kernel_size=3, stride=2, padding=1),    # Increased channels
+            nn.ReLU(),
+            nn.ConvTranspose3d(32, 16, kernel_size=3, stride=1, padding=1),    # New layer
+            nn.ReLU(),
+            nn.ConvTranspose3d(16, 1, kernel_size=3, stride=1, padding=1)      # Output layer
         )
         
-        # transform 3x3 representation to 6d representation
+        # Enhanced output projection (deeper architecture)
         self.fc_output = nn.Sequential(
-            nn.Linear(15 * 3 * 3, 15 * 6),
-            nn.Sigmoid()
+            nn.Linear(29 * 5 * 5, 2048),  # Expanded layer
+            nn.LeakyReLU(0.1),
+            nn.Linear(2048, 1024),         # New layer
+            nn.LeakyReLU(0.1),
+            nn.Linear(1024, 15 * 6),       # Final output layer (unchanged)
+            nn.Sigmoid()                   # Preserved sigmoid
         )
 
-    def forward(self, input_data, deterministic=False):
-        batch_size, seq_len = input_data.shape[0], input_data.shape[1]
-
-        # Flatten pose input: (B, T, 3, 3) -> (B, T, 9)
-        x = input_data.permute(0, 3, 1, 2).unsqueeze(1)
-        h = self.encoder(x)
-
-        # Latent space
+    def forward(self, video_input, deterministic=False):
+        B, C, T, H, W = video_input.shape
+        
+        # Input preprocessing (unchanged)
+        x = video_input.permute(0, 2, 1, 3, 4)  
+        x = x.reshape(-1, C, H, W)    
+        x = F.interpolate(x, size=(112, 112), mode='bilinear', align_corners=False)
+        x = x.view(B, T, C, 112, 112)
+        x = (x - 0.45) / 0.225
+        
+        # Feature extraction
+        features = self.backbone(x)   
+        h = self.feature_adapter(features)  
+        
+        # Latent space (unchanged)
         mu = self.fc_mu(h)
         logvar = torch.clamp(self.fc_logvar(h), min=-10, max=10)
-
-        # Reparameterization trick
+        
+        # Sampling
         embedding = mu
         if not deterministic:
             std = torch.exp(0.5 * logvar)
             embedding = embedding + torch.randn_like(std) * std
-
-        h = self.fc_decode(embedding)
-        output = self.decoder(h)
-        output = output.squeeze(1)
         
-        # transform to 6D representation
-        output_flat = output.view(batch_size, -1)  # (B, 135)
-        output_6d = self.fc_output(output_flat)  # (B, 90)
-        output_6d = output_6d.view(batch_size, 15, 6)  # (B, 15, 6)
-
+        # Decoding
+        h = self.fc_decode(embedding)
+        output = self.decoder(h)       
+        output = output.squeeze(1)     
+        
+        # Output projection
+        output_flat = output.reshape(B, -1)
+        output_6d = self.fc_output(output_flat).view(B, 15, 6)
+        
         return output_6d, mu, logvar
 
 class ForwardKinematics:
@@ -334,10 +426,10 @@ class ForwardKinematics:
                 lower = float(limit.get("lower", "0"))
                 upper = float(limit.get("upper", "0"))
                 self.joint_limits[joint_name] = (lower, upper)
-        
+
         self.selected_indices = [
-            self.all_joints.index(j) 
-            for j in self.selected_joints 
+            self.all_joints.index(j)
+            for j in self.selected_joints
             if j in self.all_joints
         ]
 
@@ -356,14 +448,14 @@ class ForwardKinematics:
         with torch.no_grad():
             zero_joints = torch.zeros(len(self.all_joints))
             fk_result = self.robot_chain.forward_kinematics(zero_joints)
-            
+
             # Precompute reference points
             shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
             forearm_pos = fk_result["right_Forearm_1"].get_matrix()[:, :3, 3]
             wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
-            
+
             # Calculate reference length
-            self.L_ref = (torch.norm(shoulder_pos - forearm_pos) + 
+            self.L_ref = (torch.norm(shoulder_pos - forearm_pos) +
                           torch.norm(wrist_pos - forearm_pos)) / 2.0
 
     def batch_forward_kinematics(self, batch_joint_values):
@@ -385,21 +477,21 @@ class ForwardKinematics:
         full_joints[:, :, self.selected_indices] = denormalized
         joints_flat = full_joints.view(-1, len(self.all_joints))
         fk_result = self.robot_chain.forward_kinematics(joints_flat)
-        
+
         # 4. Extract and normalize positions
         shoulder_pos = fk_result["right_Arm_1"].get_matrix()[:, :3, 3]
         wrist_pos = fk_result["right_Wrist"].get_matrix()[:, :3, 3]
         finger1_pos = fk_result["right_Finger_1_1"].get_matrix()[:, :3, 3]
         finger4_pos = fk_result["right_Finger_4_1"].get_matrix()[:, :3, 3]
-        
+
         normalized = torch.stack([
             (wrist_pos - shoulder_pos) / self.L_ref,
             (finger1_pos - shoulder_pos) / self.L_ref,
             (finger4_pos - shoulder_pos) / self.L_ref,
         ], dim=2).view(batch_size, seq_len, 3, 3)
-        
+
         return batch_vectors_to_6D(normalized.to(device))
-    
+
     def forward_kinematics(self, batch_joint_values):
         """
         Compute forward kinematics for a batch of joint values
@@ -427,7 +519,7 @@ class ForwardKinematics:
                 output_positions.append(self.robot_chain.forward_kinematics(full_joint_values.unsqueeze(0)))
 
         return output_positions
-    
+
     def _parse_urdf_hierarchy(self) -> Dict[str, str]:
         """
         Simplified URDF parser to get link parent-child relationships
@@ -435,17 +527,17 @@ class ForwardKinematics:
         """
         # In practice, you'd want to use a proper URDF parser here
         # This is a simplified version that might need adjustment
-        
+
         import xml.etree.ElementTree as ET
         tree = ET.parse(self.urdf_path)
         root = tree.getroot()
-        
+
         hierarchy = {}
         for joint in root.findall('joint'):
             parent = joint.find('parent').get('link')
             child = joint.find('child').get('link')
             hierarchy[child] = parent
-        
+
         return hierarchy
 
     def visualize(self, fk_result, pose, title, path):
@@ -469,7 +561,7 @@ class ForwardKinematics:
         for name, tf in fk_result.items():
             pos = tf.get_matrix()[:, :3, 3].detach().numpy()  # Extract translation component
             positions[name] = (pos - origin) / self.L_ref.detach().numpy()
-        
+
         # Draw connections based on hierarchy
         for child, parent in self.link_parents.items():
             if parent in positions and child in positions:
@@ -503,7 +595,7 @@ class ForwardKinematics:
         y = [dy + pose[3,1], dy + pose[4,1]]
         z = [dz + pose[3,2], dz + pose[4,2]]
         ax.plot(x, y, z, 'r-', linewidth=2)
-        
+
         # Set plot limits
         all_pos = np.array(list(positions.values()))
         all_pos_2 = np.array(list(pose))
@@ -511,7 +603,7 @@ class ForwardKinematics:
         ax.set_xlim([-max_range, max_range])
         ax.set_ylim([-max_range, max_range])
         ax.set_zlim([-max_range, max_range])
-        
+
         ax.set_title(title)
         ax.view_init(elev = 0, azim = 90)
         # plt.draw()
@@ -521,12 +613,12 @@ class ForwardKinematics:
         ax.view_init(elev = 90, azim = 90)
         plt.savefig(os.path.join(path, f'up {title}.png'))
 
-        # plt.pause(0.3)
-    
+        plt.close('all')
+
     def animate_movement(self, batch_joint_values, pose, path):
         """
         Animate a sequence of joint angle configurations
-        
+
         Args:
             joint_angle_sequence: List of dictionaries containing joint angles
         """
@@ -550,11 +642,11 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     u = u / (torch.norm(u, dim=-1, keepdim=True) + eps)
     v = pose[:,:,1] - root
     v = v / (torch.norm(v, dim=-1, keepdim=True) + eps)
-    
+
     # Orthogonalize v w.r.t. u (Gram-Schmidt)
     v_ortho = v - (torch.sum(u * v, dim=-1, keepdim=True) * u)
     v_ortho = v_ortho / (torch.norm(v_ortho, dim=-1, keepdim=True) + eps)
-    
+
     # Stack u and v_ortho to form 6D representation
     six_d = torch.stack([root, root+0.2*u, root+0.2*v_ortho], dim=-1)
     return six_d
@@ -562,7 +654,7 @@ def batch_vectors_to_6D(pose: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
 def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7, single=False):
     """
     Computes the loss between the predicted and actual pose data (no FK needed)
-    
+
     Args:
         pose_data: Ground truth pose data [batch, 15, 3, 3]
         model_output: Model predictions [batch, 15, 6] => directly output from network in 6D form
@@ -570,7 +662,7 @@ def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7
         lambda_kl: Weight for KL divergence loss
         lambda_vel: Weight for velocity loss
         eps: Small epsilon value to prevent division by zero
-        
+
     Returns:
         Tuple of total loss and individual loss components
     """
@@ -579,9 +671,9 @@ def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7
     # pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
     # pose_loss = mse_loss(model_output, pose_data)
     #errors = torch.abs(model_output - pose_data)
-    
+
     # Convert pose_data to 6D representation
-    kine_output = fk.batch_forward_kinematics(model_output)  
+    kine_output = fk.batch_forward_kinematics(model_output)
     # calculate position loss using 6d representation
     errors = torch.abs(kine_output - pose_data)
     max_per_joint, _ = torch.max(
@@ -592,69 +684,146 @@ def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7
 
     return pose_loss
 
-def test_model(sample_path, urdf_path, model_path, output_path):
+def test_model(video_dir, urdf_path, model_path, output_path):
     """
     Test the neural network model
     """
-
-    model = PoseVideoCNNRNN().to(device)
-    model.load_state_dict(torch.load(model_path, weights_only=True))
-    model.eval()
-
-    fk = ForwardKinematics(urdf_path)
-
-    f = open(os.path.join(output_path, "results.log"), 'w')
-
-    for sample in sample_path:
-        pose, viz = _load_protobuf(sample+".pb")
-        pose = pose.unsqueeze(0).to(device)
-        viz = viz.unsqueeze(0).to(device)
+    with torch.no_grad():
+        model = PoseVideoCNNRNN().to(device)
+        model.load_state_dict(torch.load(model_path, weights_only=True))
+        model.eval()
         
-        # Forward pass through the model to get 6D representation
-        model_output, _, _ = model(pose, deterministic=True)
-
-        f.write("------ "+sample+" ------\n")
-        print("------ "+sample+" ------\n")
+        fk = ForwardKinematics(urdf_path)
         
-        for i in range(15):
-            pose_loss = loss_fn(fk, pose[:,i].unsqueeze(0), model_output[:,i].unsqueeze(0), single=True)
-            f.write(f"- frame {i} Pose Loss: {pose_loss:.5f}\n")
-        
-        pose_loss = loss_fn(fk, pose[:,:], model_output)
-        f.write(f"\nPose Loss: {pose_loss:.5f}\n")
-        print(f"\nPose Loss: {pose_loss:.5f}\n")
-
-        path = os.path.join(output_path,"fig",sample.split("/")[-1])
-        if os.path.exists(path):
-            for filename in os.listdir(path):
-                file_path = os.path.join(path, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
+        if isinstance(video_dir, str) and os.path.isdir(video_dir):
+            video_files = glob.glob(os.path.join(video_dir, "*.mp4"))
+            video_dir = [f[:-4] for f in video_files]
         else:
-            os.makedirs(path)
-        fk.animate_movement(model_output, viz.cpu(), path)
+            print("Invalid directory")
+            return False
+        
+        f = open(os.path.join(output_path, "results.log"), 'w')
+        
+        for video_base_path in video_dir:
+            video_name = os.path.basename(video_base_path)
+            
+            print(f"Processing video: {video_name}")
+            f.write(f"====== {video_name} ======\n")
+            
+            video_file = video_base_path + ".mp4"
+            if not os.path.exists(video_file):
+                print(f"Video file not found!")
+                f.write(f"Video file not found!")
+                continue
+            
+            pb_file = video_base_path + ".pb"
+            if not os.path.exists(pb_file):
+                print(f"PB file not found!")
+                f.write(f"PB file not found!")
+                continue
+            
+            # new 
+            video_chunks = _load_video_chunks(video_file)
+            pose_full, viz_full = _load_protobuf(pb_file)
 
-    # print("zipping...")
-    # shutil.make_archive(output_path, 'zip', os.path.dirname(output_path) )
+            # Create Hamming window (non-zero at edges to avoid division issues)
+            window = torch.hamming_window(15, periodic=False, device=device)
+            window = window.view(1, 15, 1)  # Shape: [15, 1] for broadcasting
+
+            # Initialize accumulation buffers
+            T = pose_full.shape[0]
+            full_output = torch.zeros(T, 6, device=device)
+            full_weights = torch.zeros(T, device=device)
+            frame_indices = torch.arange(T, device=device)
+            
+            for chunk_idx, video_chunk in enumerate(video_chunks):
+                start_frame = chunk_idx
+                end_frame = chunk_idx + 15  # 15 frames total (0-14)
+                
+                pose_chunk = pose_full[start_frame:end_frame]
+                
+                video_input = video_chunk.unsqueeze(0).to(device)
+                pose_input = pose_chunk.unsqueeze(0).to(device)
+                
+                model_output, _, _ = model(video_input, deterministic=True)
+
+                weighted_chunks = model_output * window
+                chunk_mask = (frame_indices >= start_frame) & (frame_indices < end_frame)
+                full_output[chunk_mask] += weighted_chunks.view(-1, 6)
+                full_weights[chunk_mask] += window.squeeze()
+                
+                pose_loss = loss_fn(fk, pose_input, model_output)
+                
+                chunk_name = f"{video_name}_{start_frame}_{end_frame}"
+                f.write(f"Chunk {chunk_name}: Pose Loss: {pose_loss:.5f}\n")
+                # print(f"Chunk {chunk_name}: Pose Loss: {pose_loss:.5f}")
+                
+                # viz_chunk = viz_full[start_frame:end_frame]
+                # viz_input = viz_chunk.unsqueeze(0).to(device)
+                # chunk_output_path = os.path.join(output_path, "fig", video_name, chunk_name)
+                # if os.path.exists(chunk_output_path):
+                #     for filename in os.listdir(chunk_output_path):
+                #         file_path = os.path.join(chunk_output_path, filename)
+                #         if os.path.isfile(file_path):
+                #             os.remove(file_path)
+                # else:
+                #     os.makedirs(chunk_output_path)
+                # fk.animate_movement(model_output, viz_input.cpu(), chunk_output_path)
+            
+            full_weights = torch.clamp(full_weights, min=1e-8)
+            final_output = full_output / full_weights.unsqueeze(1)
+
+            pose_loss = loss_fn(fk, pose_full.unsqueeze(0).to(device), final_output.unsqueeze(0))
+
+            f.write(f"\n Total Pose Loss: {pose_loss:.5f}\n")
+            print(f"\n Total Pose Loss: {pose_loss:.5f}")
+            
+            fig_output_path = os.path.join(output_path, "fig", video_name)
+            if os.path.exists(fig_output_path):
+                for filename in os.listdir(fig_output_path):
+                    file_path = os.path.join(fig_output_path, filename)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+            else:
+                os.makedirs(fig_output_path)
+            fk.animate_movement(final_output.unsqueeze(0), viz_full.unsqueeze(0).cpu(), fig_output_path)
+        f.close()
+        print("Processing completed!")
+        # print("zipping...")
+        # shutil.make_archive(output_path, 'zip', os.path.dirname(output_path) )
 
 def main():
-    """Main function to parse arguments and run the training or testing process"""
+    """Main function to parse arguments and run the testing process"""
+    DEFAULT_NAME = "1_best"
     
-    samples = ["/home/cedra/psl_project/5_dataset/IRIB2_105_23513_117-131_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_44_7637_196-210_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_105_23513_1679-1693_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_111_6667_1214-1228_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_117_22098_832-846_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_48_13327_842-856_left"]
-
-    model_path = "/home/cedra/psl_project/results/final2/sign_language_pose_model_v3.2_100.pth"
-
+    parser = argparse.ArgumentParser(
+        description="Model Tester"
+    )
+    
+    parser.add_argument(
+        "--name", type=str, help="Saved Model Name: 34_best"
+    )
+    
+    parser.add_argument(
+        "--video_dir", type=str,
+        help="path to video directory"
+    )
+    
+    args = parser.parse_args()
+    
+    name = args.name if args.name is not None else DEFAULT_NAME
+    model_path = "/home/cedra/psl_project/sign_language_pose_model_v3.1_"+name+".pth"
+    
     urdf_path="/home/cedra/psl_project/rasa/hand.urdf"
-
-    output_path="/home/cedra/psl_project/model_test"
-
+    output_path="/home/cedra/psl_project/full_test"
+    
+    if not args.video_dir:
+        video_dir = "/home/cedra/psl_project/clips/"
+    else:
+        video_dir = args.video_dir
+    
     test_model(
-        sample_path=samples,
+        video_dir=video_dir,
         model_path=model_path,
         urdf_path=urdf_path,
         output_path=output_path

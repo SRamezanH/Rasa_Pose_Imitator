@@ -1,19 +1,24 @@
 # Ignore directories
+mini_dataset/
 5_dataset/
+clips/
 rasa/
-model_test/fig/
-model_test/fig_4/
+model_test/fig*/
+full_test/fig*/
 psl_venv/
 dataset/
 meshes/
+.kiro/
 
 # Ignore specific file types
+*.nix
 *.pth
 *.log
 *.bundle
 *.zip
 *.ps1
 *.urdf
+*.tar.xz
 
 # Standard ignores (recommended)
 *.pyc
