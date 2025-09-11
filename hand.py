@@ -262,16 +262,28 @@ class PoseVideoVAE(nn.Module):
         clip_output_dim = self.clip_model.config.hidden_size  # Typically 1024
         videomae_output_dim = self.videomae_model.config.hidden_size  # Typically 1024
         combined_dim = clip_output_dim + videomae_output_dim
-        output_dim = 128
 
         # Latent space
-        self.fc_mu = nn.Linear(clip_output_dim + videomae_output_dim, output_dim)
+        self.encoder = nn.Linear(clip_output_dim + videomae_output_dim, 16*8*2*2)
 
-        self.fc_logvar = nn.Linear(clip_output_dim + videomae_output_dim, output_dim)
+        self.fc_mu = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(16*8*2*2, 16),
+            nn.LeakyReLU(0.1),
+        )
+
+        self.fc_logvar = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(16*8*2*2, 16),
+            nn.LeakyReLU(0.1),
+        )
+
+        # Decoder parameters
+        self.fc_decode = nn.Linear(16, 16 * 8 * 2 * 2)
 
         # Decoder parameters
         self.decoder = nn.Sequential(
-            nn.Unflatten(1, (16, 2, 2, 2)),
+            nn.Unflatten(1, (16, 8, 2, 2)),
             nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1, output_padding=(1, 0, 0)),
             nn.ReLU(),
             nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
@@ -279,7 +291,7 @@ class PoseVideoVAE(nn.Module):
         
         # transform 3x3 representation to 6d representation
         self.fc_output = nn.Sequential(
-            nn.Linear(36, 16 * 6),
+            nn.Linear(16 * 3 * 3, 16 * 6),
             nn.Sigmoid()
         )
 
@@ -312,8 +324,9 @@ class PoseVideoVAE(nn.Module):
             combined = torch.cat([clip_features, videomae_features], dim=1)
 
         # Latent space
-        mu = self.fc_mu(combined)
-        logvar = torch.clamp(self.fc_logvar(combined), min=-10, max=10)
+        h = self.encoder(combined)
+        mu = self.fc_mu(h)
+        logvar = torch.clamp(self.fc_logvar(h), min=-10, max=10)
 
         # Reparameterization trick
         embedding = mu
@@ -321,7 +334,8 @@ class PoseVideoVAE(nn.Module):
             std = torch.exp(0.5 * logvar)
             embedding = embedding + torch.randn_like(std) * std
 
-        output = self.decoder(embedding)
+        h = self.fc_decode(embedding)
+        output = self.decoder(h)
         output = output.squeeze(1)
         
         # transform to 6D representation
