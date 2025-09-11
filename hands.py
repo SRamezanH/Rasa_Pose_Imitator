@@ -7,7 +7,7 @@ import glob
 import os
 import sys
 import xml.etree.ElementTree as ET
-import zipfile
+import random
 
 # Third-party imports
 import pytorch_kinematics as pk
@@ -15,14 +15,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import random
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision.io import read_video
+from torchvision import transforms
+from torch.utils.data import DataLoader, Dataset, random_split
+
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
-from torch.utils.data import DataLoader, Dataset, random_split
 
 try:
     from torchinfo import summary
@@ -64,22 +65,6 @@ this_module = sys.modules[__name__]
 pose_data_pb2 = this_module
 sys.modules["pose_data_pb2"] = this_module
 
-
-# Utility Functions
-def extract_zip(zip_file_path, extract_to_path):
-    """
-    Extracts a zip file to the specified path
-
-    Args:
-        zip_file_path (str): Path to the zip file
-        extract_to_path (str): Path to extract the zip file to
-    """
-    os.makedirs(extract_to_path, exist_ok=True)
-    with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
-        zip_ref.extractall(extract_to_path)
-    print(f"Files extracted to {extract_to_path}")
-
-
 # Module for processing protobuf data
 class ProtobufProcessor:
     @staticmethod
@@ -96,7 +81,7 @@ class ProtobufProcessor:
         x = getattr(point, "x", 0.0)
         y = getattr(point, "y", 0.0)
         z = getattr(point, "z", 0.0)
-        return torch.tensor([[-x*273.0/210.0, -z, -y]])  # Flip the coordinate system for compatibility
+        return torch.tensor([[-x, -z, -y]])  # Flip the coordinate system for compatibility
 
     @staticmethod
     def extract_landmark_coordinates(frame, landmark_type, indices):
@@ -139,128 +124,102 @@ class ProtobufProcessor:
 
 # Dataset class for handling video and pose data
 class PoseVideoDataset(Dataset):
-    def __init__(self, root_dir, transform=None, validate_files=True):
+    def __init__(self, pb_root_dir, video_root_dir, length=16):
         """
         Args:
-            root_dir (string): Directory with all the videos and protobuf files
-            transform (callable, optional): Optional transform to be applied on samples
-            validate_files (bool): Whether to validate files during initialization
+            pb_root_dir (string): Directory with all the protobuf files
+            video_root_dir (string): Directory with all the videos files
+            length (int): total frames in a sample
         """
-        self.root_dir = root_dir
-        self.transform = transform
-        self.video_files = sorted(glob.glob(os.path.join(root_dir, "*.mp4")))
-        self.valid_indices = []
-        self.print_warnings = True
-        
-        if validate_files:
-            print("Validating video files...")
-            # Use tqdm if available for progress bar
-            try:
-                from tqdm import tqdm
-                iterator = tqdm(enumerate(self.video_files), total=len(self.video_files), desc="Validating videos")
-            except ImportError:
-                iterator = enumerate(self.video_files)
-                
-            for i, video_path in iterator:
-                pb_path = video_path.replace(".mp4", ".pb")
-                is_valid = True
-                
-                # Check if video file can be opened
-                try:
-                    video_test, _, _ = read_video(video_path ,output_format="TCHW")
-                    is_valid = video_test.shape[0] == 15
-                    
-                    # Check if protobuf file exists and can be loaded
-                    if is_valid and not os.path.exists(pb_path):
-                        if self.print_warnings:
-                            print(f"Warning: Missing protobuf file for {video_path}")
-                        is_valid = False
-                    
-                except Exception as e:
-                    if self.print_warnings:
-                        print(f"Warning: Error validating {video_path}: {str(e)}")
-                    is_valid = False
-                
-                if is_valid:
-                    self.valid_indices.append(i)
-            
-            print(f"Found {len(self.valid_indices)} valid videos out of {len(self.video_files)} total videos")
-        else:
-            # If not validating, assume all files are valid
-            self.valid_indices = list(range(len(self.video_files)))
+        self.pb_root_dir = pb_root_dir
+        self.video_root_dir = video_root_dir
+        self.length = length
+        self.samples = []
+        # Frame preprocessor for CLIP
+        self.clip_transform = transforms.Compose([
+            transforms.Resize((224, 224)),  # Resize for CLIP
+            transforms.Normalize(mean=[0.4815, 0.4578, 0.4082],
+                                 std=[0.2686, 0.2613, 0.2758])
+        ])
+        for pb_string in sorted(glob.glob(os.path.join(pb_root_dir, "*.pb"))):
+            parts = os.path.basename(pb_string).replace('.pb', '').split('_')
+            if not parts[-1] == "fingers":
+                video_name = os.path.join(video_root_dir, '_'.join(parts[:-2]) + ".mp4")
+                start, end = map(int, parts[-2].split('-'))
+                left = parts[-1].lower() == 'left'
+                for t in range(start, end-self.length+1, int(length/4)):
+                    self.samples.append({
+                        'pb_path': pb_string,
+                        # 'video_path': video_name,
+                        # 'video_start': t-1,
+                        'pb_start': t-start,
+                        'left': left
+                    })
+        random.shuffle(self.samples)
 
     def __len__(self):
-        return len(self.valid_indices)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        # Get the actual file index from valid_indices list
-        file_idx = self.valid_indices[idx]
+        """
+        Args:
+            idx (int): sample index
+        """
         # Load video file
-        video_path = self.video_files[file_idx]
-
-        # Derive protobuf path from video path
-        pb_path = video_path.replace(".mp4", ".pb")
+        sample = self.samples[idx]
 
         # Load video frames - no try/except as we've pre-validated
-        video_data = self._load_video(video_path)
+        #video_data = self._load_video(sample["video_path"], sample["video_start"], self.length)
 
         # Load pose data from protobuf
-        pose_data = self._load_protobuf(pb_path)
+        pose_data = self._load_protobuf(sample["pb_path"], sample["pb_start"], self.length, sample["left"])
 
-        sample = {"name": video_path, "video": video_data, "pose": pose_data}
+        return {"pose": pose_data}
 
-        if self.transform:
-            sample = self.transform(sample)
-
-        return sample
-
-    def _load_video(self, video_path):
+    def _load_video(self, video_path, start, length):
         """
-        Load and process video frames using OpenCV.
+        Load and process video frames.
 
         Args:
             video_path (string): Path to the video file
+            start (int): the start frame of video chunk
+            length (int): the length of video chunk
 
         Returns:
-            torch.Tensor: Tensor containing video frames with shape  [15, 3, 273, 210]
+            torch.Tensor: Tensor containing video frames with shape  [length, 3, 273, 210]
         """
-        # Open the video file
-        # video, _, _ = read_video(video_path ,output_format="TCHW")
-        # video_tensor = video.to(device)
-        # video_tensor = video_tensor[:15, :3, :210, :273]
-        # num_frames, ch, h, w = video_tensor.shape
-        # if num_frames < 15:
-        #     print("Low frame count" + video_path)
-        #     padding = torch.zeros([15 - num_frames, ch, h, w ]).to(device)
-        #     video_tensor = torch.cat((video_tensor, padding), dim=0)
+        with torch.no_grad():
+            #Open the video file
+            video, _, _ = read_video(video_path, pts_unit="pts", output_format="TCHW")
+            video = video[start:start+length]
+            video_tensor = video.to(device, dtype=torch.float32)
 
-        #return video_tensor.permute(0,1,3,2) / 255.0
-        return torch.zeros([15, 3, 273, 210])# video_tensor / 255.0
+            return torch.stack([self.clip_transform(frame) for frame in video_tensor])
 
-    def _load_protobuf(self, pb_path):
+    def _load_protobuf(self, pb_path, start, length, left):
         """
         Load and process protobuf file containing pose data.
 
         Args:
             pb_path (string): Path to the protobuf file
+            start (int): the start frame of chunk
+            length (int): the length of chunk
+            left (bool): is it left hand data?
 
         Returns:
-            torch.Tensor: Tensor containing pose data with shape [15, feature_size]
+            torch.Tensor: Tensor containing pose data with shape [length, feature_size]
                          where feature_size is the total number of landmarks * 3 (x, y, z)
         """
         proto_data = ProtobufProcessor.load_protobuf_data(pb_path)
-        left_side = pb_path.endswith("_left.pb")
 
         pose_tensor = torch.empty([0, 3, 3], dtype=torch.float32)
 
-        for frame in proto_data.frames:
-            # Extract and normalize landmarks for body, left hand, and right hand
-            pose_landmarks = ProtobufProcessor.extract_landmark_coordinates(
-                frame, "pose_landmarks", range(10)
-            )  # Body landmarks
+        for frame in proto_data.frames[start:start+length]:
+            # Extract and normalize landmarks
+            pose_landmarks = ProtobufProcessor.extract_landmark_coordinates(frame, "pose_landmarks", range(10))
             
             # Normalize the extracted landmarks
-            selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
+            selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left)
 
             pose_tensor = torch.cat((pose_tensor, selected_landmarks), dim=0)
 
@@ -268,15 +227,14 @@ class PoseVideoDataset(Dataset):
 
         # Ensure we have exactly 15 frames
         num_frames, feature_size, dim_size = pose_tensor.shape
-        if num_frames < 15:
+        if num_frames < length:
             print("Low frame count" + pb_path)
-            padding = torch.zeros([15 - num_frames, feature_size, dim_size ]).to(device)
+            padding = torch.zeros([length - num_frames, feature_size, dim_size ]).to(device)
             pose_tensor = torch.cat((pose_tensor, padding), dim=0)
-        elif num_frames > 15:
-            pose_tensor = pose_tensor[:15, :, :]
+        elif num_frames > length:
+            pose_tensor = pose_tensor[:length, :, :]
 
         return batch_vectors_to_6D(pose_tensor)
-
 
 # Neural Network Model Definition
 
@@ -286,10 +244,12 @@ class PoseVideoCNNRNN(nn.Module):
 
         # Temporal RNN (LSTM)
         self.encoder = nn.Sequential(
+            #nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=(1, 1, 1)),  # (8, 15, 3, 3)
             nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),  # (8, 15, 3, 3)
             nn.ReLU(),
             nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1), # (16, 8, 2, 2)
             nn.ReLU(),
+            nn.AdaptiveAvgPool3d((8, 2, 2)),
             nn.Flatten()
         )
 
@@ -311,14 +271,14 @@ class PoseVideoCNNRNN(nn.Module):
 
         self.decoder = nn.Sequential(
             nn.Unflatten(1, (16, 8, 2, 2)),
-            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1),# output_padding=(1,1,1)),
+            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1, output_padding=(1, 0, 0)),
             nn.ReLU(),
             nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
         )
         
         # transform 3x3 representation to 6d representation
         self.fc_output = nn.Sequential(
-            nn.Linear(15 * 3 * 3, 15 * 6),
+            nn.Linear(16 * 3 * 3, 16 * 6),
             nn.Sigmoid()
         )
 
@@ -344,9 +304,9 @@ class PoseVideoCNNRNN(nn.Module):
         output = output.squeeze(1)
         
         # transform to 6D representation
-        output_flat = output.view(batch_size, -1)  # (B, 135)
-        output_6d = self.fc_output(output_flat)  # (B, 90)
-        output_6d = output_6d.view(batch_size, 15, 6)  # (B, 15, 6)
+        output_flat = output.view(batch_size, -1)
+        output_6d = self.fc_output(output_flat)
+        output_6d = output_6d.view(batch_size, 16, 6)
 
         return output_6d, mu, logvar
 
@@ -616,7 +576,7 @@ def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0
     else:
         return final_value
 
-def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.001):
+def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_size=8, learning_rate=0.001):
     """
     Train the neural network model
 
@@ -636,8 +596,8 @@ def train_model(data_dir, test_dir, urdf_path, num_epochs=10, batch_size=8, lear
         print(f"    - Memory: {torch.cuda.get_device_properties(cuda_id).total_memory / (1024**3):.2f} GB")
 
     # Create dataset with validation to filter out corrupted videos
-    dataset = PoseVideoDataset(root_dir=data_dir, validate_files=False)
-    test_dataset = PoseVideoDataset(root_dir=test_dir, validate_files=False)
+    dataset = PoseVideoDataset(data_dir, video_dir)
+    test_dataset = PoseVideoDataset(test_dir, video_dir)
     
     if len(dataset) == 0:
         print("No valid videos found in the dataset. Please check your data files.")
@@ -922,28 +882,28 @@ def main():
     """Main function to parse arguments and run the training or testing process"""
 
     # default values
-    DEFAULT_DATA_DIR = "/home/cedra/psl_project/5_dataset"
-    TEST_DATA_DIR = "/home/cedra/psl_project/5_dataset/test"
-    DEFAULT_URDF_PATH = "/home/cedra/psl_project/rasa/hand.urdf"
+    DEFAULT_DATA_DIR = "../dataset"
+    DEFAULT_TEST_DIR = "../dataset/test"
+    DEFAULT_VIDEO_DIR = "../1_clips"
+    DEFAULT_URDF_PATH = "../rasa/hand.urdf"
     DEFAULT_NUM_EPOCHS = 100
-    DEFAULT_BATCH_SIZE = 64
-    DEFAULT_TEST_ONLY = False
-    DEFAULT_EXTRACT_ZIP = None
+    DEFAULT_BATCH_SIZE = 16
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser(
         description="Sign Language Recognition using Pose Estimation"
     )
     parser.add_argument(
-        "--data_dir", type=str, help="Path to the dataset directory (default: dataset)"
+        "--data_dir", type=str, help="Path to the dataset directory"
     )
     parser.add_argument(
-        "--test_dir", type=str, help="Path to the test dataset directory (default: dataset)"
+        "--test_dir", type=str, help="Path to the test dataset directory"
     )
     parser.add_argument(
-        "--urdf_path",
-        type=str,
-        help="Path to the robot URDF file (default: rasa/robot.urdf)",
+        "--video_dir", type=str, help="Path to the video dataset directory"
+    )    
+    parser.add_argument(
+        "--urdf_path", type=str, help="Path to the robot URDF file (default: rasa/robot.urdf)",
     )
     parser.add_argument(
         "--num_epochs", type=int, help="Number of training epochs (default: 10)"
@@ -951,53 +911,33 @@ def main():
     parser.add_argument(
         "--batch_size", type=int, help="Batch size for training (default: 8)"
     )
-    parser.add_argument(
-        "--test_only",
-        action="store_true",
-        help="Only test the dataset without training",
-    )
-    parser.add_argument(
-        "--extract_zip", type=str, help="Extract a zip file to the dataset directory"
-    )
 
     args = parser.parse_args()
 
     # Use command-line arguments if provided, otherwise use defaults
     data_dir = args.data_dir if args.data_dir is not None else DEFAULT_DATA_DIR
-    test_dir = args.test_dir if args.test_dir is not None else TEST_DATA_DIR
+    test_dir = args.test_dir if args.test_dir is not None else DEFAULT_TEST_DIR
+    video_dir = args.video_dir if args.video_dir is not None else DEFAULT_VIDEO_DIR
     urdf_path = args.urdf_path if args.urdf_path is not None else DEFAULT_URDF_PATH
     num_epochs = args.num_epochs if args.num_epochs is not None else DEFAULT_NUM_EPOCHS
     batch_size = args.batch_size if args.batch_size is not None else DEFAULT_BATCH_SIZE
-    test_only = args.test_only if args.test_only else DEFAULT_TEST_ONLY
-    zip_file_path = (
-        args.extract_zip if args.extract_zip is not None else DEFAULT_EXTRACT_ZIP
-    )
 
     print(f"Using data directory: {data_dir}")
     print(f"Using test directory: {test_dir}")
+    print(f"Using video directory: {video_dir}")
     print(f"Using URDF path: {urdf_path}")
     print(f"Number of epochs: {num_epochs}")
     print(f"Batch size: {batch_size}")
-    print(f"Test only mode: {test_only}")
-    if zip_file_path:
-        print(f"Extracting zip file: {zip_file_path}")
 
-    # Extract zip file if specified
-    if zip_file_path:
-        extract_zip(zip_file_path, os.path.dirname(data_dir))
-
-    # Test dataset only
-    if test_only:
-        test_dataset(data_dir)
-    else:
-        # Train model
-        train_model(
-            data_dir=data_dir,
-            test_dir=test_dir,
-            urdf_path=urdf_path,
-            num_epochs=num_epochs,
-            batch_size=batch_size,
-        )
+    # Train model
+    train_model(
+        data_dir=data_dir,
+        test_dir=test_dir,
+        video_dir=video_dir,
+        urdf_path=urdf_path,
+        num_epochs=num_epochs,
+        batch_size=batch_size,
+    )
 
 if __name__ == "__main__":
     main()
