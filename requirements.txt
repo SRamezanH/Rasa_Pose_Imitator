@@ -4,5 +4,7 @@ numpy==1.26.4  # Specific version for pytorch-kinematics compatibility
 opencv-python>=4.11.0.86
 pytorch-kinematics>=0.7.5
 protobuf>=6.30.1
+transformers
+torchinfo
 tqdm
 av
