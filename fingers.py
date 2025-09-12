@@ -317,7 +317,7 @@ class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
-        # --- Encoder: برای داده‌های pose به شکل (B, 1, 15, 10, 3)
+        # --- Encoder:
         self.encoder = nn.Sequential(
             nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),   # → (B, 8, 15, 10, 3)
             nn.ReLU(),
@@ -354,7 +354,7 @@ class PoseVideoCNNRNN(nn.Module):
 
         # Final linear output: map back to (15 time steps, 6 values each)
         # self.fc_output = nn.Linear(15 * 10 * 3, 15 * 6)
-        self.fc_output = nn.Linear(640, 16 * 6)
+        self.fc_output = nn.Linear(640, 16 * 7)
 
     def forward(self, pose_input, deterministic=False):
         # pose_input: (B, 15, 10, 3)
@@ -380,7 +380,7 @@ class PoseVideoCNNRNN(nn.Module):
         # --- Final linear mapping to 6D
         flat = output.view(output.size(0), -1)       # → (B, 15×10×3)
         out_6d = self.fc_output(flat)                # → (B, 15×6)
-        out_6d = out_6d.view(-1, 16, 6)               # → (B, 15, 6)
+        out_6d = out_6d.view(-1, 16, 7)               # → (B, 15, 6)
 
         return out_6d, mu, logvar
 
@@ -398,8 +398,9 @@ class ForwardKinematics:
         self.all_joints = None
         self.joint_limits = {}
 
-        # Define the joints used as input (6 in total)
+        # Define the joints used as input (7 in total)
         self.selected_joints = [
+            "right_Finger_1_4",
             "right_Finger_1_4",
             "right_Finger_2_4",
             "right_Finger_3_4",
