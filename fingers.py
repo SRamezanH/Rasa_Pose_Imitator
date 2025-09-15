@@ -19,6 +19,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision.io import read_video
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset, random_split
+from soft_dtw import SoftDTW
 
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
@@ -37,6 +38,7 @@ except ImportError:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 mse_loss = nn.MSELoss()
+dtw = SoftDTW(gamma=1.0, normalize=True) # just like nn.MSELoss()
 
 # Constants
 POSE_FEATURE_SIZE = 225  # 75 landmarks × 3 coordinates
@@ -201,7 +203,7 @@ def transform_points(data):
     # Apply R2 to points
     points = torch.matmul(R2.unsqueeze(-3), points.unsqueeze(-1)).squeeze(-1)  # (B, S, N, 3)
 
-    return torch.nan_to_num(points, nan=0.0)
+    return (torch.nan_to_num(points, nan=0.0) + torch.tensor([-1.0, -0.5, 0.0])) / 2.0
 
 # Dataset class for handling video and pose data
 class PoseVideoDataset(Dataset):
@@ -343,18 +345,38 @@ class PoseVideoCNNRNN(nn.Module):
         )
 
         # Decoder
-        self.fc_decode = nn.Linear(latent_dim, 16 * 8 * 5 * 2)
+        # self.fc_decode = nn.Linear(latent_dim, 16 * 8 * 5 * 2)
 
-        self.decoder = nn.Sequential(
-            nn.Unflatten(1, (16, 8, 5, 2)),
-            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1, output_padding=(1, 1, 1)),
-            nn.ReLU(),
-            nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
+        # self.decoder = nn.Sequential(
+        #     nn.Unflatten(1, (16, 8, 5, 2)),
+        #     nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1, output_padding=(1, 1, 1)),
+        #     nn.ReLU(),
+        #     nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
+        # )
+
+        # # Final linear output: map back to (15 time steps, 6 values each)
+        # self.fc_output = nn.Sequential(
+        #     nn.Linear(640, 16 * 7),
+        #     nn.Sigmoid()
+        # )
+
+        self.hidden_size = 128
+        self.num_layers = 2
+        self.t = 16
+        self.output_size = 7
+
+        # Project the initial condition to the RNN's initial hidden state
+        self.hidden_proj = nn.Linear(latent_dim, self.num_layers * self.hidden_size)
+        self.cell_proj = nn.Linear(latent_dim, self.num_layers * self.hidden_size)
+        
+        # The core RNN cell (LSTM is chosen here)
+        self.rnn = nn.LSTM(7, self.hidden_size, self.num_layers, batch_first=True)
+        
+        # The linear layer that maps the RNN output to the desired output size
+        self.fc_out = nn.Sequential(
+            nn.Linear(self.hidden_size, self.output_size),
+            nn.Sigmoid()
         )
-
-        # Final linear output: map back to (15 time steps, 6 values each)
-        # self.fc_output = nn.Linear(15 * 10 * 3, 15 * 6)
-        self.fc_output = nn.Linear(640, 16 * 7)
 
     def forward(self, pose_input, deterministic=False):
         # pose_input: (B, 15, 10, 3)
@@ -373,16 +395,56 @@ class PoseVideoCNNRNN(nn.Module):
             embedding += torch.randn_like(std) * std
 
         # --- Decoder
-        h = self.fc_decode(embedding)
-        output = self.decoder(h)        # → (B, 1, 15, 10, 3)
-        output = output.squeeze(1)      # → (B, 15, 10, 3)
+        # h = self.fc_decode(embedding)
+        # output = self.decoder(h)        # → (B, 1, 15, 10, 3)
+        # output = output.squeeze(1)      # → (B, 15, 10, 3)
 
-        # --- Final linear mapping to 6D
-        flat = output.view(output.size(0), -1)       # → (B, 15×10×3)
-        out_6d = self.fc_output(flat)                # → (B, 15×6)
-        out_6d = out_6d.view(-1, 16, 7)               # → (B, 15, 6)
+        # # --- Final linear mapping to 6D
+        # flat = output.view(output.size(0), -1)       # → (B, 15×10×3)
+        # out_6d = self.fc_output(flat)                # → (B, 15×6)
+        # generated_sequence = out_6d.view(-1, 16, 7)               # → (B, 15, 6)
 
-        return out_6d, mu, logvar
+        batch_size = embedding.size(0)
+        # 1. Initialize the hidden state using the condition vector
+        # Project and reshape to (num_layers, batch_size, hidden_size)
+        hidden_init = self.hidden_proj(embedding) # (batch, num_layers * hidden_size)
+        hidden_init = hidden_init.view(batch_size, self.num_layers, self.hidden_size)
+        hidden_init = hidden_init.permute(1, 0, 2) # (num_layers, batch, hidden_size)
+        hidden_init = hidden_init.contiguous()
+        
+        cell_init = self.cell_proj(embedding) # (batch, num_layers * hidden_size)
+        cell_init = cell_init.view(batch_size, self.num_layers, self.hidden_size)
+        cell_init = cell_init.permute(1, 0, 2) # (num_layers, batch, hidden_size)
+        cell_init = cell_init.contiguous()
+        hidden = (hidden_init, cell_init) # Tuple for LSTM
+
+        # 2. Prepare the first input (start token).
+        # For the first step, we need an input. We can use a learned start token or zeros.
+        # This is a learned parameter that gets optimized during training.
+        if not hasattr(self, 'start_token'):
+            self.start_token = nn.Parameter(torch.zeros(1, 1, self.output_size))
+        # Expand the start token to match the batch size
+        decoder_input = self.start_token.expand(batch_size, 1, self.output_size)
+
+        # 3. Autoregressive generation loop
+        outputs = []
+        for _ in range(self.t):
+            # decoder_input shape for each step: (batch, 1, input_size==7)
+            rnn_out, hidden = self.rnn(decoder_input, hidden)
+            # rnn_out shape: (batch, 1, hidden_size)
+
+            # Predict the output for this time step
+            out_step = self.fc_out(rnn_out) # (batch, 1, 7)
+            outputs.append(out_step)
+
+            # The output becomes the input for the next time step (teacher forcing is handled elsewhere)
+            decoder_input = out_step.detach() # Use .detach() during inference to prevent backprop through the whole sequence
+
+        # 4. Concatenate all time steps
+        # Stack along the time dimension (dim=1)
+        generated_sequence = torch.cat(outputs, dim=1) # (batch, t, 7)
+
+        return generated_sequence, mu, logvar
 
 
 class ForwardKinematics:
@@ -490,7 +552,7 @@ class ForwardKinematics:
         normalized = transform_points(normalized.view(batch_size, seq_len, 7, 3).to(device))
         return normalized
 
-def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_max=1.0, lambda_kl=0.1, lambda_vel=10.0, eps=1e-7):
+def loss_fn(fk, pose_data, model_output, logvar, mu, gamma=1.0, normalize=True, lambda_kl=0.1, eps=1e-7):
     """
     Computes the loss between the predicted and actual pose data (no FK needed)
 
@@ -509,21 +571,54 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, lambda_max=1.0, lambda_kl=0
     """
     kine_output = fk.batch_forward_kinematics(model_output)
 
-    # calculate position loss using 6d representation
     pose_loss = mse_loss(kine_output, pose_data)
-    errors = torch.abs(kine_output - pose_data)
-    max_per_joint, _ = torch.max(
-            errors.reshape(errors.size(0), errors.size(1), -1),
-            dim=1  # Reduce across frames and coordinates
-        )
-    max_loss = torch.mean(max_per_joint)
 
-    # KL divergence loss for VAE regularization
+    batch_size, time_steps, n_series, dim = kine_output.shape
+    
+    # # Compute distance matrix
+    # pred_expanded = kine_output.unsqueeze(2)  # (batch, time_pred, 1, n, dim)
+    # target_expanded = pose_data.unsqueeze(1)    # (batch, 1, time_target, n, dim)
+    # distance_matrix = torch.sum((pred_expanded - target_expanded) ** 2, dim=(-1, -2))
+    
+    # # Initialize cost matrix
+    # cost_matrix = torch.zeros(batch_size, time_steps, time_steps, 
+    #                          device=device)
+    
+    # # First row and column
+    # cost_matrix[:, 0, 0] = distance_matrix[:, 0, 0]
+    
+    # # Fill first row
+    # for j in range(1, time_steps):
+    #     cost_matrix[:, 0, j] = cost_matrix[:, 0, j-1] + distance_matrix[:, 0, j]
+    
+    # # Fill first column
+    # for i in range(1, time_steps):
+    #     cost_matrix[:, i, 0] = cost_matrix[:, i-1, 0] + distance_matrix[:, i, 0]
+    
+    # # Fill the rest of the matrix
+    # for i in range(1, time_steps):
+    #     for j in range(1, time_steps):
+    #         min_prev = torch.min(
+    #             torch.stack([
+    #                 cost_matrix[:, i-1, j],
+    #                 cost_matrix[:, i, j-1],
+    #                 cost_matrix[:, i-1, j-1]
+    #             ], dim=1),
+    #             dim=1
+    #         )[0]
+    #         cost_matrix[:, i, j] = min_prev + distance_matrix[:, i, j]
+    
+    # dtw_distances = cost_matrix[:, -1, -1]
+    
+    # dtw_loss = torch.mean(dtw_distances) / (2*time_steps)
+    # dtw_loss = dtw(kine_output.view(batch_size, time_steps, -1), pose_data.view(batch_size, time_steps, -1)).mean()
+    distances = torch.norm(kine_output - pose_data, dim=-1)
+    max_loss = torch.max(distances)
+
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
     # Combine all loss terms
-    loss = pose_loss + lambda_kl * kl_loss + lambda_max * max_loss
-
+    loss = pose_loss + lambda_kl * kl_loss
     return loss, pose_loss, max_loss, kl_loss
 
 def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0.5):
@@ -618,7 +713,6 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)#geoopt.optim.RiemannianAdam(model.parameters(), lr=learning_rate)
     scheduler = ReduceLROnPlateau(optimizer, 'min')
 
-
     # Initialize forward kinematics
     fk = ForwardKinematics(urdf_path)
 
@@ -641,7 +735,7 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
         model.train()  # Set model to training mode
         total_loss = 0
         total_pose_loss = 0
-        total_max_loss = 0
+        total_dtw_loss = 0
         total_kl_loss = 0
 
         # Create progress bar for batches
@@ -654,7 +748,6 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
         )
 
         lambda_kl = lambda_scheduler(epoch, warmup_start=5, warmup_end=15, final_value=0.1)#0.1 * (min(1, 0.005 * (epoch+1)))
-        lambda_max = lambda_scheduler(epoch, warmup_start=3, warmup_end=7, final_value=2.0)
 
         for i, batch in enumerate(batch_pbar):
             # video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
@@ -665,7 +758,7 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
             model_output, mu, logvar = model(pose_data)  # Output: [batch, 15, 6] (predicted)
 
             # Compute loss
-            loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
+            loss, pose_loss, dtw_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl)
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
@@ -675,32 +768,32 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
             # Update running loss
             loss_val = loss.item()
             pose_loss_val = pose_loss.item()
-            max_loss_val = max_loss.item()
+            dtw_loss_val = dtw_loss.item()
             kl_loss_val = kl_loss.item()
 
             total_loss += loss_val
             total_pose_loss += pose_loss_val
-            total_max_loss += max_loss_val
+            total_dtw_loss += dtw_loss_val
             total_kl_loss += kl_loss_val
 
             # Update progress bar with current loss
             batch_pbar.set_postfix({
                 'loss': f'{loss_val:.2f}',
                 'pose_loss': f'{pose_loss_val:.2f}',
-                'max_loss': f'{max_loss_val:.2f}',
+                'dtw_loss': f'{dtw_loss_val:.2f}',
                 'kl_loss': f'{kl_loss_val:.2f}'
             })
 
         total_loss /= len(train_loader)
         total_pose_loss /= len(train_loader)
-        total_max_loss /= len(train_loader)
+        total_dtw_loss /= len(train_loader)
         total_kl_loss /= len(train_loader)
 
         # Evaluation
         model.eval()  # Set model to evaluation mode
         eval_loss = 0
         eval_pose_loss = 0
-        eval_max_loss = 0
+        eval_dtw_loss = 0
         eval_kl_loss = 0
 
         # Progress bar for test batches
@@ -721,28 +814,28 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
                 model_output, mu, logvar = model(pose_data)
 
                 # Compute loss
-                loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
+                loss, pose_loss, dtw_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl)
 
                 loss_val = loss
                 pose_loss_val = pose_loss
-                max_loss_val = max_loss
+                dtw_loss_val = dtw_loss
                 kl_loss_val = kl_loss
 
                 eval_loss += loss_val
                 eval_pose_loss += pose_loss_val
-                eval_max_loss += max_loss_val
+                eval_dtw_loss += dtw_loss_val
                 eval_kl_loss += kl_loss_val
 
                 # Update progress bar
                 eval_pbar.set_postfix({
                     'loss': f'{loss_val:.2f}',
                     'pose_loss': f'{pose_loss_val:.2f}',
-                    'max_loss': f'{max_loss_val:.2f}',
+                    'dtw_loss': f'{dtw_loss_val:.2f}',
                     'kl_loss': f'{kl_loss_val:.2f}'
                 })
         eval_loss /= len(eval_loader)
         eval_pose_loss /= len(eval_loader)
-        eval_max_loss /= len(eval_loader)
+        eval_dtw_loss /= len(eval_loader)
         eval_kl_loss /= len(eval_loader)
 
         scheduler.step(eval_loss)
@@ -770,9 +863,9 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
 
         # Print epoch summary
         print(f"\nEpoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s\n"
-              f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, max Loss: {total_max_loss:.5f}, "
+              f"Train Loss: {total_loss:.5f}, Pose Loss: {total_pose_loss:.5f}, dtw Loss: {total_dtw_loss:.5f}, "
               f"KL Loss: {total_kl_loss:.5f}\n"#, Vel Loss: {total_vel_loss:.5f}, dir Loss: {total_dir_loss:.5f}\n"
-              f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, max Loss: {eval_max_loss:.5f}, "
+              f"Eval Loss: {eval_loss:.5f}, Pose Loss: {eval_pose_loss:.5f}, dtw Loss: {eval_dtw_loss:.5f}, "
               f"KL Loss: {eval_kl_loss:.5f}")#, Vel Loss: {eval_vel_loss:.5f}, dir Loss: {eval_dir_loss:.5f}")
 
     print(f"\nTraining completed in {num_epochs} epochs")
@@ -783,7 +876,7 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
     model.eval()  # Set model to evaluation mode
     test_loss = 0
     test_pose_loss = 0
-    test_max_loss = 0
+    test_dtw_loss = 0
     test_kl_loss = 0
 
     # Progress bar for test batches
@@ -808,35 +901,35 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
             model_output, mu, logvar = model(pose_data)
 
             # Compute loss
-            loss, pose_loss, max_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl, lambda_max=lambda_max)
+            loss, pose_loss, dtw_loss, kl_loss = loss_fn(fk, pose_data, model_output, logvar, mu, lambda_kl = lambda_kl)
 
             loss_val = loss
             pose_loss_val = pose_loss
-            max_loss_val = max_loss
+            dtw_loss_val = dtw_loss
             kl_loss_val = kl_loss
 
-            f.write(str(batch["name"][0])+","+str(loss_val)+","+str(pose_loss_val)+","+str(max_loss_val)+","+str(kl_loss_val)+"\n")
+            f.write(str(batch["name"][0])+","+str(loss_val)+","+str(pose_loss_val)+","+str(dtw_loss_val)+","+str(kl_loss_val)+"\n")
 
             test_loss += loss_val
             test_pose_loss += pose_loss_val
-            test_max_loss += max_loss_val
+            test_dtw_loss += dtw_loss_val
             test_kl_loss += kl_loss_val
 
             # Update progress bar
             test_pbar.set_postfix({
                 'loss': f'{loss_val:.2f}',
                 'pose_loss': f'{pose_loss_val:.2f}',
-                'max_loss': f'{max_loss_val:.2f}',
+                'dtw_loss': f'{dtw_loss_val:.2f}',
                 'kl_loss': f'{kl_loss_val:.2f}',
                 # 'vel_loss': f'{vel_loss_val:.2f}',
                 # 'dir_loss': f'{dir_loss_val:.2f}'
             })
     test_loss /= len(test_loader)
     test_pose_loss /= len(test_loader)
-    test_max_loss /= len(test_loader)
+    test_dtw_loss /= len(test_loader)
     test_kl_loss /= len(test_loader)
 
-    print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, max Loss: {test_max_loss:.5f}, "
+    print(f"\nTest Loss: {test_loss:.5f}, Pose Loss: {test_pose_loss:.5f}, dtw Loss: {test_dtw_loss:.5f}, "
           f"KL Loss: {test_kl_loss:.5f}")
 
 def main():
@@ -848,7 +941,7 @@ def main():
     DEFAULT_VIDEO_DIR = "../1_clips"
     DEFAULT_URDF_PATH = "../rasa/hand.urdf"
     DEFAULT_NUM_EPOCHS = 100
-    DEFAULT_BATCH_SIZE = 16
+    DEFAULT_BATCH_SIZE = 64
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser(
