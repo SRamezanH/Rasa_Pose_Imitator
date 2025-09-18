@@ -12,6 +12,7 @@ import glob
 import os
 import shutil
 import sys
+import math
 import xml.etree.ElementTree as ET
 
 # Third-party imports
@@ -41,7 +42,7 @@ except ImportError:
         print("Install with: pip install torchinfo\n")
         return None
 
-device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 mse_loss = nn.MSELoss()
 
@@ -90,7 +91,7 @@ class ProtobufProcessor:
         x = getattr(point, "x", 0.0)
         y = getattr(point, "y", 0.0)
         z = getattr(point, "z", 0.0)
-        return torch.tensor([[-x*273.0/210.0, -z, -y]])  # Flip the coordinate system for compatibility
+        return torch.tensor([[-x, -z, -y]])  # Flip the coordinate system for compatibility
 
     @staticmethod
     def extract_landmark_coordinates(frame, landmark_type, indices):
@@ -107,14 +108,25 @@ class ProtobufProcessor:
         return transformed_landmarks
 
     @staticmethod
+    @staticmethod
     def normalize_body_landmarks(landmarks, left_side):
-        """Normalize body landmarks using shoulders as reference points"""
+        """
+        Normalize all 10 body landmarks using shoulders as reference points.
+
+        Args:
+            landmarks (torch.Tensor): Shape (10, 3), 3D coordinates of body landmarks.
+            left_side (bool): Whether the landmarks belong to the left arm.
+
+        Returns:
+            torch.Tensor: Normalized landmarks of shape (1, 10, 3)
+        """
         if landmarks.shape[0] < 10:
             return torch.zeros((1, 7, 3))  # Return zero if not enough landmarks
 
         # Flip x for left side
         if left_side:
             landmarks[:, 0] *= -1
+            landmarks[:, 2] *= -1
         origin = landmarks[0].clone().detach()  # left shoulder
         
         # Normalize all 10 landmarks using origin and scale
@@ -142,6 +154,31 @@ class ProtobufProcessor:
         
         return normalized[indices].unsqueeze(0)  # Shape: (1, 10, 3)
 
+def scale_theta(points, scale=1.0):
+    """
+    Scale the angular component θ of a set of 3D points using cylindrical coordinates.
+    
+    Args:
+        points: Tensor of shape (batch, t, n, 3) in Cartesian coordinates (x, y, z)
+        theta_scale: Float, linear scale factor to apply to θ (angle)
+
+    Returns:
+        Tensor of shape (batch, t, n, 3), transformed back to Cartesian coordinates
+    """
+    x, y, z = points.unbind(-1)
+    
+    # Compute theta and scale it
+    theta = torch.atan2(y, x)
+    scale_expanded = scale.repeat(1, 1, points.size(2))
+    theta_scaled = theta * scale_expanded
+    
+    # Compute new x, y coordinates
+    rho = torch.sqrt(x**2 + y**2)
+    x_scaled = rho * torch.cos(theta_scaled)
+    y_scaled = rho * torch.sin(theta_scaled)
+    
+    return torch.stack([x_scaled, y_scaled, z], dim=-1)
+
 def transform_points(data):
     """
     Transforms 3D points so that:
@@ -164,7 +201,7 @@ def transform_points(data):
     v1_unit = v1 / (v1_norm + 1e-8)  # Avoid division by zero
 
     # Target direction is x-axis
-    x_axis = torch.tensor([1.0, 0.0, 0.0], device=data.device).expand_as(v1)
+    x_axis = torch.tensor([1.0, 0.0, 0.0], device=device).expand_as(v1)
 
     # Compute axis of rotation (cross product) and angle (dot product)
     axis = torch.cross(v1_unit, x_axis, dim=-1)  # (B, S, 3)
@@ -175,7 +212,7 @@ def transform_points(data):
     angle = torch.acos(dot)  # (B, S, 1)
 
     # Rodrigues' rotation formula to build rotation matrix R1
-    K = torch.zeros(*axis.shape[:-1], 3, 3, device=data.device)  # (B, S, 3, 3)
+    K = torch.zeros(*axis.shape[:-1], 3, 3, device=device)  # (B, S, 3, 3)
     ax, ay, az = axis_unit.unbind(dim=-1)
     zero = torch.zeros_like(ax)
 
@@ -186,7 +223,7 @@ def transform_points(data):
     K[..., 2, 0] = -ay
     K[..., 2, 1] = ax
 
-    I = torch.eye(3, device=data.device).expand(*axis.shape[:-1], 3, 3)
+    I = torch.eye(3, device=device).expand(*axis.shape[:-1], 3, 3)
     sin = torch.sin(angle)[..., None]
     cos = torch.cos(angle)[..., None]
     K2 = K @ K
@@ -209,7 +246,7 @@ def transform_points(data):
     sin_t = torch.sin(-theta)
 
     # Build rotation matrix R2 (x-axis rotation)
-    R2 = torch.zeros(*theta.shape, 3, 3, device=data.device)
+    R2 = torch.zeros(*theta.shape, 3, 3, device=device)
     R2[..., 0, 0] = 1
     R2[..., 1, 1] = cos_t
     R2[..., 1, 2] = -sin_t
@@ -218,54 +255,52 @@ def transform_points(data):
 
     # Apply R2 to points
     points = torch.matmul(R2.unsqueeze(-3), points.unsqueeze(-1)).squeeze(-1)  # (B, S, N, 3)
+    scale = (0.25*math.pi)/torch.acos((P2 * x_axis).sum(dim=-1, keepdim=True)/(torch.norm(P2, dim=-1, keepdim=True) + 1e-8))
+    points = scale_theta(points, scale)
 
-    return torch.nan_to_num(points, nan=0.0)
+    return (torch.nan_to_num(points, nan=0.0) + torch.tensor([-1.0, -0.5, 0.0], device=device)) / 2.0
 
-def _load_protobuf(pb_path):
+def _load_protobuf(pb_path, left):
     """
     Load and process protobuf file containing pose data.
 
     Args:
         pb_path (string): Path to the protobuf file
+        start (int): the start frame of chunk
+        length (int): the length of chunk
+        left (bool): is it left hand data?
 
     Returns:
-        torch.Tensor: Tensor containing pose data with shape [15, feature_size]
+        torch.Tensor: Tensor containing pose data with shape [length, feature_size]
                         where feature_size is the total number of landmarks * 3 (x, y, z)
     """
     proto_data = ProtobufProcessor.load_protobuf_data(pb_path)
-    left_side = pb_path.endswith("_left.pb")
 
     pose_tensor = torch.empty([0, 7, 3], dtype=torch.float32)
     viz_tensor = torch.empty([0, 22, 3], dtype=torch.float32)
 
-    for frame in proto_data.frames:
-        # Extract and normalize landmarks for body, left hand, and right hand
+    for frame in proto_data.frames[0:16]:
         pose_landmarks = ProtobufProcessor.extract_landmark_coordinates(
-                frame,
-                "left_hand_landmarks" if left_side else "right_hand_landmarks",
-                range(21)
-            )
-        
-        # Normalize the extracted landmarks
-        # selected_landmarks, h = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
-        selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left_side)
-        selected_landmarks_for_viz = ProtobufProcessor.normalize_body_landmarks_for_viz(pose_landmarks, left_side)
+            frame,
+            "left_hand_landmarks" if left else "right_hand_landmarks",
+            range(21)
+        )
+
+        selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left)
+        selected_landmarks_for_viz = ProtobufProcessor.normalize_body_landmarks_for_viz(pose_landmarks, left)
 
         pose_tensor = torch.cat((pose_tensor, selected_landmarks), dim=0)
         viz_tensor = torch.cat((viz_tensor, selected_landmarks_for_viz), dim=0)
-        # break
 
-    pose_tensor = transform_points(pose_tensor.unsqueeze(0)).squeeze().to(device)
-    viz_tensor = transform_points(viz_tensor.unsqueeze(0)).squeeze()
-
-    # Ensure we have exactly 15 frames
-    num_frames, feature_size, dim_size = pose_tensor.shape
-    if num_frames < 15:
-        print("Low frame count" + pb_path)
-        padding = torch.zeros([15 - num_frames, feature_size, dim_size ]).to(device)
-        pose_tensor = torch.cat((pose_tensor, padding), dim=0)
-    elif num_frames > 15:
-        pose_tensor = pose_tensor[:15, :, :]
+    pose_tensor = transform_points(pose_tensor.unsqueeze(0).to(device)).squeeze()
+    viz_tensor = transform_points(viz_tensor.unsqueeze(0).to(device)).squeeze()
+    # Ensure we have exactly length frames
+    # num_frames = pose_tensor.shape[0]
+    # if num_frames < length:
+    #     padding = torch.zeros([length - num_frames, 5, 3], dtype=torch.float32)
+    #     pose_tensor = torch.cat((pose_tensor, padding), dim=0)
+    # elif num_frames > length:
+    #     pose_tensor = pose_tensor[:length, :, :]
 
     return pose_tensor, viz_tensor
 
@@ -273,12 +308,13 @@ class PoseVideoCNNRNN(nn.Module):
     def __init__(self):
         super(PoseVideoCNNRNN, self).__init__()
 
-        # --- Encoder: برای داده‌های pose به شکل (B, 1, 15, 10, 3)
+        # --- Encoder:
         self.encoder = nn.Sequential(
             nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),   # → (B, 8, 15, 10, 3)
             nn.ReLU(),
             nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),  # → (B, 16, 8, 5, 2)
             nn.ReLU(),
+            nn.AdaptiveAvgPool3d((8, 2, 2)),
             nn.Flatten()  # → (B, 16*8*5*2)
         )
 
@@ -287,13 +323,13 @@ class PoseVideoCNNRNN(nn.Module):
         # Latent layers (mean + logvar)
         self.fc_mu = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(16 * 8 * 3 * 2, latent_dim),
+            nn.Linear(16 * 8 * 2 * 2, latent_dim),
             nn.LeakyReLU(0.1)
         )
 
         self.fc_logvar = nn.Sequential(
             nn.Dropout(0.1),
-            nn.Linear(16 * 8 * 3 * 2, latent_dim),
+            nn.Linear(16 * 8 * 2 * 2, latent_dim),
             nn.LeakyReLU(0.1)
         )
 
@@ -308,8 +344,28 @@ class PoseVideoCNNRNN(nn.Module):
         )
 
         # Final linear output: map back to (15 time steps, 6 values each)
-        # self.fc_output = nn.Linear(15 * 10 * 3, 15 * 6)
-        self.fc_output = nn.Linear(640, 15 * 6)
+        self.fc_output = nn.Sequential(
+            nn.Linear(640, 16 * 7),
+            nn.Sigmoid()
+        )
+
+        # self.hidden_size = 128
+        # self.num_layers = 2
+        # self.t = 16
+        # self.output_size = 7
+
+        # # Project the initial condition to the RNN's initial hidden state
+        # self.hidden_proj = nn.Linear(latent_dim, self.num_layers * self.hidden_size)
+        # self.cell_proj = nn.Linear(latent_dim, self.num_layers * self.hidden_size)
+        
+        # # The core RNN cell (LSTM is chosen here)
+        # self.rnn = nn.LSTM(7, self.hidden_size, self.num_layers, batch_first=True)
+        
+        # # The linear layer that maps the RNN output to the desired output size
+        # self.fc_out = nn.Sequential(
+        #     nn.Linear(self.hidden_size, self.output_size),
+        #     nn.Sigmoid()
+        # )
 
     def forward(self, pose_input, deterministic=False):
         # pose_input: (B, 15, 10, 3)
@@ -317,6 +373,7 @@ class PoseVideoCNNRNN(nn.Module):
         x = pose_input.unsqueeze(1)
         # --- Encoder
         h = self.encoder(x)
+
         mu = self.fc_mu(h)
         logvar = torch.clamp(self.fc_logvar(h), min=-10, max=10)
 
@@ -331,12 +388,52 @@ class PoseVideoCNNRNN(nn.Module):
         output = self.decoder(h)        # → (B, 1, 15, 10, 3)
         output = output.squeeze(1)      # → (B, 15, 10, 3)
 
-        # --- Final linear mapping to 6D
+        # # --- Final linear mapping to 6D
         flat = output.view(output.size(0), -1)       # → (B, 15×10×3)
         out_6d = self.fc_output(flat)                # → (B, 15×6)
-        out_6d = out_6d.view(-1, 15, 6)               # → (B, 15, 6)
+        generated_sequence = out_6d.view(-1, 16, 7)               # → (B, 15, 6)
 
-        return out_6d, mu, logvar
+        # batch_size = embedding.size(0)
+        # # 1. Initialize the hidden state using the condition vector
+        # # Project and reshape to (num_layers, batch_size, hidden_size)
+        # hidden_init = self.hidden_proj(embedding) # (batch, num_layers * hidden_size)
+        # hidden_init = hidden_init.view(batch_size, self.num_layers, self.hidden_size)
+        # hidden_init = hidden_init.permute(1, 0, 2) # (num_layers, batch, hidden_size)
+        # hidden_init = hidden_init.contiguous()
+        
+        # cell_init = self.cell_proj(embedding) # (batch, num_layers * hidden_size)
+        # cell_init = cell_init.view(batch_size, self.num_layers, self.hidden_size)
+        # cell_init = cell_init.permute(1, 0, 2) # (num_layers, batch, hidden_size)
+        # cell_init = cell_init.contiguous()
+        # hidden = (hidden_init, cell_init) # Tuple for LSTM
+
+        # # 2. Prepare the first input (start token).
+        # # For the first step, we need an input. We can use a learned start token or zeros.
+        # # This is a learned parameter that gets optimized during training.
+        # if not hasattr(self, 'start_token'):
+        #     self.start_token = nn.Parameter(torch.zeros(1, 1, self.output_size))
+        # # Expand the start token to match the batch size
+        # decoder_input = self.start_token.expand(batch_size, 1, self.output_size)
+
+        # # 3. Autoregressive generation loop
+        # outputs = []
+        # for _ in range(self.t):
+        #     # decoder_input shape for each step: (batch, 1, input_size==7)
+        #     rnn_out, hidden = self.rnn(decoder_input, hidden)
+        #     # rnn_out shape: (batch, 1, hidden_size)
+
+        #     # Predict the output for this time step
+        #     out_step = self.fc_out(rnn_out) # (batch, 1, 7)
+        #     outputs.append(out_step)
+
+        #     # The output becomes the input for the next time step (teacher forcing is handled elsewhere)
+        #     decoder_input = out_step.detach() # Use .detach() during inference to prevent backprop through the whole sequence
+
+        # # 4. Concatenate all time steps
+        # # Stack along the time dimension (dim=1)
+        # generated_sequence = torch.cat(outputs, dim=1) # (batch, t, 7)
+
+        return generated_sequence, mu, logvar
 
 class ForwardKinematics:
     def __init__(self, urdf_path):
@@ -351,6 +448,7 @@ class ForwardKinematics:
         self.all_joints = None
         self.joint_limits = {}
         self.selected_joints = [
+            "right_Finger_1_1",
             "right_Finger_1_4",
             "right_Finger_2_4",
             "right_Finger_3_4",
@@ -358,6 +456,33 @@ class ForwardKinematics:
             "thumb1",
             "thumb2"
         ]
+        # self.mimicjoints = {
+        #     "right_Finger_1_1":["right_Finger_2_1", "right_Finger_3_1", "right_Finger_4_1"],
+        #     "right_Finger_1_4":["right_Finger_1_3", "right_Finger_1_2"],
+        #     "right_Finger_2_4":["right_Finger_2_3", "right_Finger_2_2"],
+        #     "right_Finger_3_4":["right_Finger_3_3", "right_Finger_3_2"],
+        #     "right_Finger_4_4":["right_Finger_4_3", "right_Finger_4_2"]
+        # }
+
+        self.A = torch.zeros(24, 7, device=device)
+        self.A[6, 0] = 1.0
+        self.A[7, 1] = 1.1
+        self.A[8, 1] = 1.0
+        self.A[9, 1] = 1.0
+        self.A[10, 0] = 1.0
+        self.A[11, 2] = 1.1
+        self.A[12, 2] = 1.0
+        self.A[13, 2] = 1.0
+        self.A[14, 0] = -1.0
+        self.A[15, 3] = 1.1
+        self.A[16, 3] = 1.0
+        self.A[17, 3] = 1.0
+        self.A[18, 0] = -1.0
+        self.A[19, 4] = 1.1
+        self.A[20, 4] = 1.0
+        self.A[21, 4] = 1.0
+        self.A[22, 5] = 1.0
+        self.A[23, 6] = 1.0
 
         self.load_robot()
 
@@ -411,8 +536,10 @@ class ForwardKinematics:
         batch_size, seq_len, _ = batch_joint_values.shape
 
         denormalized = (batch_joint_values.cpu() * self.joint_ranges) + self.joint_lowers
-        full_joints = torch.zeros((batch_size, seq_len, len(self.all_joints)))
-        full_joints[:, :, self.selected_indices] = denormalized
+        full_joints = torch.matmul(denormalized, self.A.T)
+        # full_joints = torch.zeros((batch_size, seq_len, len(self.all_joints)))
+        # full_joints[:, :, self.selected_indices] = denormalized
+            
         joints_flat = full_joints.view(-1, len(self.all_joints))
         fk_result = self.robot_chain.forward_kinematics(joints_flat)
         
@@ -458,12 +585,17 @@ class ForwardKinematics:
         for b in range(batch_size):
             for t in range(seq_len):
                 joint_values = batch_joint_values[b, t, :]
-                full_joint_values = torch.zeros(len(self.all_joints))
-                for i, joint_name in enumerate(self.selected_joints):
-                    if joint_name in self.joint_limits:
-                        lower, upper = self.joint_limits[joint_name]
-                        denormalized_value = (joint_values[i] * (upper - lower)) + lower
-                        full_joint_values[self.all_joints.index(joint_name)] = denormalized_value
+                denormalized = (joint_values.cpu() * self.joint_ranges) + self.joint_lowers
+                full_joint_values = torch.matmul(denormalized, self.A.T)
+                # full_joint_values = torch.zeros(len(self.all_joints))
+                # for i, joint_name in enumerate(self.selected_joints):
+                #     if joint_name in self.joint_limits:
+                #         lower, upper = self.joint_limits[joint_name]
+                #         denormalized_value = (joint_values[i] * (upper - lower)) + lower
+                #         full_joint_values[self.all_joints.index(joint_name)] = denormalized_value
+                #         # if joint_name in self.mimicjoints:
+                #         #     for j in self.mimicjoints[joint_name]:
+                #         #         full_joint_values[self.all_joints.index(j["name"])] = denormalized_value * j["mul"]
                 output_positions.append(self.robot_chain.forward_kinematics(full_joint_values.unsqueeze(0)))
 
         return output_positions
@@ -509,8 +641,9 @@ class ForwardKinematics:
         f11 = fk_result["right_Finger_1_1"].get_matrix()[:, :3, 3] - origin
         f41 = fk_result["right_Finger_4_1"].get_matrix()[:, :3, 3] - origin
         for name, tf in fk_result.items():
-            pos = torch.cat((tf.get_matrix()[:, :3, 3] - origin, f11, f41), dim=0)
-            positions[name] = transform_points(pos.unsqueeze(0).unsqueeze(0)).squeeze().detach().numpy()
+            if name not in ["right_Forearm_2", "right_Forearm_1", "right_Arm_2", "right_Arm_1", "right_Shoulder_2", "right_Shoulder_1"]:
+                pos = torch.cat((tf.get_matrix()[:, :3, 3] - origin, f11, f41), dim=0)
+                positions[name] = transform_points(pos.unsqueeze(0).unsqueeze(0).to(device)).squeeze().detach().cpu().numpy()
         
         # Draw connections based on hierarchy
         for child, parent in self.link_parents.items():
@@ -524,8 +657,8 @@ class ForwardKinematics:
         # pose = pose *0.2
         for i in range(pose.size(0)):
             if i in [0,4,8,12,16]:
-                x = [0, pose[i,0]]
-                y = [0, pose[i,1]]
+                x = [-0.5, pose[i,0]]
+                y = [-0.25, pose[i,1]]
                 z = [0, pose[i,2]]
             else:
                 x = [pose[i-1,0], pose[i,0]]
@@ -536,7 +669,7 @@ class ForwardKinematics:
         # Set plot limits
         all_pos = np.array(list(positions.values()))
         all_pos_2 = np.array(list(pose))
-        max_range = max(np.max(np.abs(all_pos)), np.max(np.abs(all_pos_2))) * 1.1
+        max_range = 1
         ax.set_xlim([-max_range, max_range])
         ax.set_ylim([-max_range, max_range])
         ax.set_zlim([-max_range, max_range])
@@ -589,15 +722,11 @@ def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7
     kine_output = fk.batch_forward_kinematics(model_output)
 
     # calculate position loss using 6d representation
-    pose_loss = 0#mse_loss(kine_output, pose_data)
-    errors = torch.abs(kine_output - pose_data)
-    max_per_joint, _ = torch.max(
-            errors.reshape(errors.size(0), errors.size(1), -1),
-            dim=1  # Reduce across frames and coordinates
-        )
-    max_loss = torch.mean(max_per_joint)
+    pose_loss = mse_loss(kine_output, pose_data)
+    distances = torch.norm(kine_output - pose_data, dim=-1)
+    max_loss = torch.max(distances)
 
-    return max_loss
+    return pose_loss
 
 def test_model(sample_path, urdf_path, model_path, output_path):
     """
@@ -605,7 +734,7 @@ def test_model(sample_path, urdf_path, model_path, output_path):
     """
 
     model = PoseVideoCNNRNN().to(device)
-    model.load_state_dict(torch.load(model_path, weights_only=True))
+    model.load_state_dict(torch.load(model_path, weights_only=True, map_location=torch.device('cpu')), strict=False)
     model.eval()
 
     fk = ForwardKinematics(urdf_path)
@@ -613,17 +742,20 @@ def test_model(sample_path, urdf_path, model_path, output_path):
     f = open(os.path.join(output_path, "results.log"), 'w')
 
     for sample in sample_path:
-        pose, viz = _load_protobuf(sample+".pb")
+        left = os.path.basename(sample).replace('.pb', '').split('_')[-2].lower() == 'left'
+
+        pose, viz = _load_protobuf(sample+".pb", left)
         pose = pose.unsqueeze(0).to(device)
         viz = viz.unsqueeze(0).to(device)
         
         # Forward pass through the model to get 6D representation
-        model_output, _, _ = model(pose, deterministic=True)
+        # model_output, _, _ = model(pose, deterministic=True)
+        model_output = torch.ones((1, 16, 7))
 
         f.write("------ "+sample+" ------\n")
         print("------ "+sample+" ------\n")
         
-        for i in range(15):
+        for i in range(16):
             pose_loss = loss_fn(fk, pose[:,i].unsqueeze(0), model_output[:,i].unsqueeze(0), single=True)
             f.write(f"- frame {i} Pose Loss: {pose_loss:.5f}\n")
         
@@ -647,18 +779,15 @@ def test_model(sample_path, urdf_path, model_path, output_path):
 def main():
     """Main function to parse arguments and run the training or testing process"""
     
-    samples = ["/home/cedra/psl_project/5_dataset/IRIB2_105_23513_117-131_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_44_7637_196-210_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_105_23513_1679-1693_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_111_6667_1214-1228_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_117_22098_832-846_right",
-                "/home/cedra/psl_project/5_dataset/IRIB2_48_13327_842-856_left"]
+    samples = ["../dataset/test/Deafinno_6_574-600_left_fingers",
+                "../dataset/test/Deafinno_6_737-758_left_fingers",
+                "../dataset/test/Deafinno_6_738-759_right_fingers"]
 
-    model_path = "/home/cedra/psl_project/sign_language_finger_model_v1.0_32.pth"
+    model_path = "sign_language_finger_model_v1.0_1_best.pth"
 
-    urdf_path="/home/cedra/psl_project/rasa/fingers.urdf"
+    urdf_path="../rasa/hand.urdf"
 
-    output_path="/home/cedra/psl_project/model_test"
+    output_path="model_test/"
 
     test_model(
         sample_path=samples,

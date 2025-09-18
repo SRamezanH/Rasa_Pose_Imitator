@@ -8,6 +8,7 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 import random
+import math
 
 # Third-party imports
 import pytorch_kinematics as pk
@@ -117,6 +118,7 @@ class ProtobufProcessor:
         # Flip x for left side
         if left_side:
             landmarks[:, 0] *= -1
+            landmarks[:, 2] *= -1
         origin = landmarks[0].clone().detach()  # left shoulder
         
         # Normalize all 10 landmarks using origin and scale
@@ -125,6 +127,31 @@ class ProtobufProcessor:
         indices = [20, 16, 12, 8, 4, 17, 5]
 
         return normalized[indices].unsqueeze(0)  # Shape: (1, 10, 3)
+
+def scale_theta(points, scale=1.0):
+    """
+    Scale the angular component θ of a set of 3D points using cylindrical coordinates.
+    
+    Args:
+        points: Tensor of shape (batch, t, n, 3) in Cartesian coordinates (x, y, z)
+        theta_scale: Float, linear scale factor to apply to θ (angle)
+
+    Returns:
+        Tensor of shape (batch, t, n, 3), transformed back to Cartesian coordinates
+    """
+    x, y, z = points.unbind(-1)
+    
+    # Compute theta and scale it
+    theta = torch.atan2(y, x)
+    scale_expanded = scale.repeat(1, 1, points.size(2))
+    theta_scaled = theta * scale_expanded
+    
+    # Compute new x, y coordinates
+    rho = torch.sqrt(x**2 + y**2)
+    x_scaled = rho * torch.cos(theta_scaled)
+    y_scaled = rho * torch.sin(theta_scaled)
+    
+    return torch.stack([x_scaled, y_scaled, z], dim=-1)
 
 def transform_points(data):
     """
@@ -148,7 +175,7 @@ def transform_points(data):
     v1_unit = v1 / (v1_norm + 1e-8)  # Avoid division by zero
 
     # Target direction is x-axis
-    x_axis = torch.tensor([1.0, 0.0, 0.0], device=data.device).expand_as(v1)
+    x_axis = torch.tensor([1.0, 0.0, 0.0], device=device).expand_as(v1)
 
     # Compute axis of rotation (cross product) and angle (dot product)
     axis = torch.cross(v1_unit, x_axis, dim=-1)  # (B, S, 3)
@@ -159,7 +186,7 @@ def transform_points(data):
     angle = torch.acos(dot)  # (B, S, 1)
 
     # Rodrigues' rotation formula to build rotation matrix R1
-    K = torch.zeros(*axis.shape[:-1], 3, 3, device=data.device)  # (B, S, 3, 3)
+    K = torch.zeros(*axis.shape[:-1], 3, 3, device=device)  # (B, S, 3, 3)
     ax, ay, az = axis_unit.unbind(dim=-1)
     zero = torch.zeros_like(ax)
 
@@ -170,7 +197,7 @@ def transform_points(data):
     K[..., 2, 0] = -ay
     K[..., 2, 1] = ax
 
-    I = torch.eye(3, device=data.device).expand(*axis.shape[:-1], 3, 3)
+    I = torch.eye(3, device=device).expand(*axis.shape[:-1], 3, 3)
     sin = torch.sin(angle)[..., None]
     cos = torch.cos(angle)[..., None]
     K2 = K @ K
@@ -193,7 +220,7 @@ def transform_points(data):
     sin_t = torch.sin(-theta)
 
     # Build rotation matrix R2 (x-axis rotation)
-    R2 = torch.zeros(*theta.shape, 3, 3, device=data.device)
+    R2 = torch.zeros(*theta.shape, 3, 3, device=device)
     R2[..., 0, 0] = 1
     R2[..., 1, 1] = cos_t
     R2[..., 1, 2] = -sin_t
@@ -202,8 +229,10 @@ def transform_points(data):
 
     # Apply R2 to points
     points = torch.matmul(R2.unsqueeze(-3), points.unsqueeze(-1)).squeeze(-1)  # (B, S, N, 3)
+    scale = (0.25*math.pi)/torch.acos((P2 * x_axis).sum(dim=-1, keepdim=True)/(torch.norm(P2, dim=-1, keepdim=True) + 1e-8))
+    points = scale_theta(points, scale)
 
-    return (torch.nan_to_num(points, nan=0.0) + torch.tensor([-1.0, -0.5, 0.0])) / 2.0
+    return (torch.nan_to_num(points, nan=0.0) + torch.tensor([-1.0, -0.5, 0.0], device=device)) / 2.0
 
 # Dataset class for handling video and pose data
 class PoseVideoDataset(Dataset):
@@ -301,7 +330,7 @@ class PoseVideoDataset(Dataset):
             selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left)
             pose_tensor = torch.cat((pose_tensor, selected_landmarks), dim=0)
 
-        pose_tensor = transform_points(pose_tensor.unsqueeze(0)).squeeze()
+        pose_tensor = transform_points(pose_tensor.unsqueeze(0).to(device)).squeeze()
         # Ensure we have exactly length frames
         num_frames = pose_tensor.shape[0]
         if num_frames < length:
@@ -345,38 +374,38 @@ class PoseVideoCNNRNN(nn.Module):
         )
 
         # Decoder
-        # self.fc_decode = nn.Linear(latent_dim, 16 * 8 * 5 * 2)
+        self.fc_decode = nn.Linear(latent_dim, 16 * 8 * 5 * 2)
 
-        # self.decoder = nn.Sequential(
-        #     nn.Unflatten(1, (16, 8, 5, 2)),
-        #     nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1, output_padding=(1, 1, 1)),
-        #     nn.ReLU(),
-        #     nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
-        # )
+        self.decoder = nn.Sequential(
+            nn.Unflatten(1, (16, 8, 5, 2)),
+            nn.ConvTranspose3d(16, 8, kernel_size=3, stride=2, padding=1, output_padding=(1, 1, 1)),
+            nn.ReLU(),
+            nn.ConvTranspose3d(8, 1, kernel_size=3, stride=1, padding=1)
+        )
 
-        # # Final linear output: map back to (15 time steps, 6 values each)
-        # self.fc_output = nn.Sequential(
-        #     nn.Linear(640, 16 * 7),
-        #     nn.Sigmoid()
-        # )
-
-        self.hidden_size = 128
-        self.num_layers = 2
-        self.t = 16
-        self.output_size = 7
-
-        # Project the initial condition to the RNN's initial hidden state
-        self.hidden_proj = nn.Linear(latent_dim, self.num_layers * self.hidden_size)
-        self.cell_proj = nn.Linear(latent_dim, self.num_layers * self.hidden_size)
-        
-        # The core RNN cell (LSTM is chosen here)
-        self.rnn = nn.LSTM(7, self.hidden_size, self.num_layers, batch_first=True)
-        
-        # The linear layer that maps the RNN output to the desired output size
-        self.fc_out = nn.Sequential(
-            nn.Linear(self.hidden_size, self.output_size),
+        # Final linear output: map back to (15 time steps, 6 values each)
+        self.fc_output = nn.Sequential(
+            nn.Linear(640, 16 * 7),
             nn.Sigmoid()
         )
+
+        # self.hidden_size = 128
+        # self.num_layers = 2
+        # self.t = 16
+        # self.output_size = 7
+
+        # # Project the initial condition to the RNN's initial hidden state
+        # self.hidden_proj = nn.Linear(latent_dim, self.num_layers * self.hidden_size)
+        # self.cell_proj = nn.Linear(latent_dim, self.num_layers * self.hidden_size)
+        
+        # # The core RNN cell (LSTM is chosen here)
+        # self.rnn = nn.LSTM(7, self.hidden_size, self.num_layers, batch_first=True)
+        
+        # # The linear layer that maps the RNN output to the desired output size
+        # self.fc_out = nn.Sequential(
+        #     nn.Linear(self.hidden_size, self.output_size),
+        #     nn.Sigmoid()
+        # )
 
     def forward(self, pose_input, deterministic=False):
         # pose_input: (B, 15, 10, 3)
@@ -395,54 +424,54 @@ class PoseVideoCNNRNN(nn.Module):
             embedding += torch.randn_like(std) * std
 
         # --- Decoder
-        # h = self.fc_decode(embedding)
-        # output = self.decoder(h)        # → (B, 1, 15, 10, 3)
-        # output = output.squeeze(1)      # → (B, 15, 10, 3)
+        h = self.fc_decode(embedding)
+        output = self.decoder(h)        # → (B, 1, 15, 10, 3)
+        output = output.squeeze(1)      # → (B, 15, 10, 3)
 
-        # # --- Final linear mapping to 6D
-        # flat = output.view(output.size(0), -1)       # → (B, 15×10×3)
-        # out_6d = self.fc_output(flat)                # → (B, 15×6)
-        # generated_sequence = out_6d.view(-1, 16, 7)               # → (B, 15, 6)
+        # --- Final linear mapping to 6D
+        flat = output.view(output.size(0), -1)       # → (B, 15×10×3)
+        out_6d = self.fc_output(flat)                # → (B, 15×6)
+        generated_sequence = out_6d.view(-1, 16, 7)               # → (B, 15, 6)
 
-        batch_size = embedding.size(0)
-        # 1. Initialize the hidden state using the condition vector
-        # Project and reshape to (num_layers, batch_size, hidden_size)
-        hidden_init = self.hidden_proj(embedding) # (batch, num_layers * hidden_size)
-        hidden_init = hidden_init.view(batch_size, self.num_layers, self.hidden_size)
-        hidden_init = hidden_init.permute(1, 0, 2) # (num_layers, batch, hidden_size)
-        hidden_init = hidden_init.contiguous()
+        # batch_size = embedding.size(0)
+        # # 1. Initialize the hidden state using the condition vector
+        # # Project and reshape to (num_layers, batch_size, hidden_size)
+        # hidden_init = self.hidden_proj(embedding) # (batch, num_layers * hidden_size)
+        # hidden_init = hidden_init.view(batch_size, self.num_layers, self.hidden_size)
+        # hidden_init = hidden_init.permute(1, 0, 2) # (num_layers, batch, hidden_size)
+        # hidden_init = hidden_init.contiguous()
         
-        cell_init = self.cell_proj(embedding) # (batch, num_layers * hidden_size)
-        cell_init = cell_init.view(batch_size, self.num_layers, self.hidden_size)
-        cell_init = cell_init.permute(1, 0, 2) # (num_layers, batch, hidden_size)
-        cell_init = cell_init.contiguous()
-        hidden = (hidden_init, cell_init) # Tuple for LSTM
+        # cell_init = self.cell_proj(embedding) # (batch, num_layers * hidden_size)
+        # cell_init = cell_init.view(batch_size, self.num_layers, self.hidden_size)
+        # cell_init = cell_init.permute(1, 0, 2) # (num_layers, batch, hidden_size)
+        # cell_init = cell_init.contiguous()
+        # hidden = (hidden_init, cell_init) # Tuple for LSTM
 
-        # 2. Prepare the first input (start token).
-        # For the first step, we need an input. We can use a learned start token or zeros.
-        # This is a learned parameter that gets optimized during training.
-        if not hasattr(self, 'start_token'):
-            self.start_token = nn.Parameter(torch.zeros(1, 1, self.output_size))
-        # Expand the start token to match the batch size
-        decoder_input = self.start_token.expand(batch_size, 1, self.output_size)
+        # # 2. Prepare the first input (start token).
+        # # For the first step, we need an input. We can use a learned start token or zeros.
+        # # This is a learned parameter that gets optimized during training.
+        # if not hasattr(self, 'start_token'):
+        #     self.start_token = nn.Parameter(torch.zeros(1, 1, self.output_size))
+        # # Expand the start token to match the batch size
+        # decoder_input = self.start_token.expand(batch_size, 1, self.output_size)
 
-        # 3. Autoregressive generation loop
-        outputs = []
-        for _ in range(self.t):
-            # decoder_input shape for each step: (batch, 1, input_size==7)
-            rnn_out, hidden = self.rnn(decoder_input, hidden)
-            # rnn_out shape: (batch, 1, hidden_size)
+        # # 3. Autoregressive generation loop
+        # outputs = []
+        # for _ in range(self.t):
+        #     # decoder_input shape for each step: (batch, 1, input_size==7)
+        #     rnn_out, hidden = self.rnn(decoder_input, hidden)
+        #     # rnn_out shape: (batch, 1, hidden_size)
 
-            # Predict the output for this time step
-            out_step = self.fc_out(rnn_out) # (batch, 1, 7)
-            outputs.append(out_step)
+        #     # Predict the output for this time step
+        #     out_step = self.fc_out(rnn_out) # (batch, 1, 7)
+        #     outputs.append(out_step)
 
-            # The output becomes the input for the next time step (teacher forcing is handled elsewhere)
-            decoder_input = out_step.detach() # Use .detach() during inference to prevent backprop through the whole sequence
+        #     # The output becomes the input for the next time step (teacher forcing is handled elsewhere)
+        #     decoder_input = out_step.detach() # Use .detach() during inference to prevent backprop through the whole sequence
 
-        # 4. Concatenate all time steps
-        # Stack along the time dimension (dim=1)
-        generated_sequence = torch.cat(outputs, dim=1) # (batch, t, 7)
+        # # 4. Concatenate all time steps
+        # # Stack along the time dimension (dim=1)
+        # generated_sequence = torch.cat(outputs, dim=1) # (batch, t, 7)
 
         return generated_sequence, mu, logvar
 
@@ -462,7 +491,7 @@ class ForwardKinematics:
 
         # Define the joints used as input (7 in total)
         self.selected_joints = [
-            "right_Finger_1_4",
+            "right_Finger_1_1",
             "right_Finger_1_4",
             "right_Finger_2_4",
             "right_Finger_3_4",
@@ -470,6 +499,26 @@ class ForwardKinematics:
             "thumb1",
             "thumb2"
         ]
+
+        self.A = torch.zeros(24, 7, device=device)
+        self.A[6, 0] = 1.0
+        self.A[7, 1] = 1.1
+        self.A[8, 1] = 1.0
+        self.A[9, 1] = 1.0
+        self.A[10, 0] = 1.0
+        self.A[11, 2] = 1.1
+        self.A[12, 2] = 1.0
+        self.A[13, 2] = 1.0
+        self.A[14, 0] = -1.0
+        self.A[15, 3] = 1.1
+        self.A[16, 3] = 1.0
+        self.A[17, 3] = 1.0
+        self.A[18, 0] = -1.0
+        self.A[19, 4] = 1.1
+        self.A[20, 4] = 1.0
+        self.A[21, 4] = 1.0
+        self.A[22, 5] = 1.0
+        self.A[23, 6] = 1.0
 
         self.load_robot()
 
@@ -521,8 +570,9 @@ class ForwardKinematics:
         denormalized = (batch_joint_values.cpu() * self.joint_ranges) + self.joint_lowers
 
         # Prepare full joint tensor with zeros for unused joints
-        full_joints = torch.zeros((batch_size, seq_len, len(self.all_joints)))
-        full_joints[:, :, self.selected_indices] = denormalized
+        # full_joints = torch.zeros((batch_size, seq_len, len(self.all_joints)))
+        # full_joints[:, :, self.selected_indices] = denormalized
+        full_joints = torch.matmul(denormalized, self.A.T)
 
         # Flatten for batch processing
         joints_flat = full_joints.view(-1, len(self.all_joints))
