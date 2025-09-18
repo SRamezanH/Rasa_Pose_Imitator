@@ -749,8 +749,7 @@ def test_model(sample_path, urdf_path, model_path, output_path):
         viz = viz.unsqueeze(0).to(device)
         
         # Forward pass through the model to get 6D representation
-        # model_output, _, _ = model(pose, deterministic=True)
-        model_output = torch.ones((1, 16, 7))
+        model_output, _, _ = model(pose, deterministic=True)
 
         f.write("------ "+sample+" ------\n")
         print("------ "+sample+" ------\n")
