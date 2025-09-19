@@ -132,7 +132,7 @@ class ProtobufProcessor:
         # Normalize all 10 landmarks using origin and scale
         normalized = landmarks - origin
 
-        indices = [20, 16, 12, 8, 4, 17, 5]
+        indices = [20, 16, 12, 8, 2, 17, 5]
 
         return normalized[indices].unsqueeze(0)  # Shape: (1, 10, 3)
     
@@ -318,7 +318,7 @@ class PoseVideoCNNRNN(nn.Module):
             nn.Flatten()  # → (B, 16*8*5*2)
         )
 
-        latent_dim = 16
+        latent_dim = 32
 
         # Latent layers (mean + logvar)
         self.fc_mu = nn.Sequential(
@@ -780,9 +780,13 @@ def main():
     
     samples = ["../dataset/test/Deafinno_6_574-600_left_fingers",
                 "../dataset/test/Deafinno_6_737-758_left_fingers",
-                "../dataset/test/Deafinno_6_738-759_right_fingers"]
+                "../dataset/test/Deafinno_6_738-759_right_fingers",
+                "../dataset/test/Deafinno_1036_3-26_right_fingers",
+                "../dataset/test/Deafinno_1036_147-239_left_fingers",
+                "../dataset/test/yalda_3622_1-141_right_fingers",
+                "../dataset/test/IRIB2_79_8517_204-234_right_fingers"]
 
-    model_path = "sign_language_finger_model_v1.0_1_best.pth"
+    model_path = "sign_language_finger_model_v1.0_22.pth"
 
     urdf_path="../rasa/hand.urdf"
 

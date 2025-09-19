@@ -124,7 +124,7 @@ class ProtobufProcessor:
         # Normalize all 10 landmarks using origin and scale
         normalized = landmarks - origin
 
-        indices = [20, 16, 12, 8, 4, 17, 5]
+        indices = [20, 16, 12, 8, 2, 17, 5]
 
         return normalized[indices].unsqueeze(0)  # Shape: (1, 10, 3)
 
@@ -358,7 +358,7 @@ class PoseVideoCNNRNN(nn.Module):
             nn.Flatten()  # → (B, 16*8*5*2)
         )
 
-        latent_dim = 16
+        latent_dim = 32
 
         # Latent layers (mean + logvar)
         self.fc_mu = nn.Sequential(
@@ -623,52 +623,20 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, gamma=1.0, normalize=True, 
 
     pose_loss = mse_loss(kine_output, pose_data)
 
-    batch_size, time_steps, n_series, dim = kine_output.shape
-    
-    # # Compute distance matrix
-    # pred_expanded = kine_output.unsqueeze(2)  # (batch, time_pred, 1, n, dim)
-    # target_expanded = pose_data.unsqueeze(1)    # (batch, 1, time_target, n, dim)
-    # distance_matrix = torch.sum((pred_expanded - target_expanded) ** 2, dim=(-1, -2))
-    
-    # # Initialize cost matrix
-    # cost_matrix = torch.zeros(batch_size, time_steps, time_steps, 
-    #                          device=device)
-    
-    # # First row and column
-    # cost_matrix[:, 0, 0] = distance_matrix[:, 0, 0]
-    
-    # # Fill first row
-    # for j in range(1, time_steps):
-    #     cost_matrix[:, 0, j] = cost_matrix[:, 0, j-1] + distance_matrix[:, 0, j]
-    
-    # # Fill first column
-    # for i in range(1, time_steps):
-    #     cost_matrix[:, i, 0] = cost_matrix[:, i-1, 0] + distance_matrix[:, i, 0]
-    
-    # # Fill the rest of the matrix
-    # for i in range(1, time_steps):
-    #     for j in range(1, time_steps):
-    #         min_prev = torch.min(
-    #             torch.stack([
-    #                 cost_matrix[:, i-1, j],
-    #                 cost_matrix[:, i, j-1],
-    #                 cost_matrix[:, i-1, j-1]
-    #             ], dim=1),
-    #             dim=1
-    #         )[0]
-    #         cost_matrix[:, i, j] = min_prev + distance_matrix[:, i, j]
-    
-    # dtw_distances = cost_matrix[:, -1, -1]
-    
-    # dtw_loss = torch.mean(dtw_distances) / (2*time_steps)
-    # dtw_loss = dtw(kine_output.view(batch_size, time_steps, -1), pose_data.view(batch_size, time_steps, -1)).mean()
-    distances = torch.norm(kine_output - pose_data, dim=-1)
-    max_loss = torch.max(distances)
+    # distances = torch.norm(kine_output - pose_data, dim=-1)
+    # max_loss = torch.max(distances)
+
+    errors = torch.abs(kine_output - pose_data)
+    max_per_joint, _ = torch.max(
+            errors.view(errors.size(0), errors.size(1), -1),
+            dim=1  # Reduce across frames and coordinates
+        )
+    max_loss = torch.mean(max_per_joint)
 
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
     # Combine all loss terms
-    loss = pose_loss + lambda_kl * kl_loss
+    loss = max_loss + lambda_kl * kl_loss
     return loss, pose_loss, max_loss, kl_loss
 
 def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0.5):
