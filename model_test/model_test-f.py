@@ -108,6 +108,50 @@ class ProtobufProcessor:
         return transformed_landmarks
 
     @staticmethod
+    def compute_bone_vectors(landmarks):
+        """
+        landmarks: torch.Tensor of shape (21, 3)
+        returns: torch.Tensor of shape (20, 3), each row is a bone vector
+        """
+        bone_connections = [
+            (0, 1), (1, 2), (2, 3), (3, 4),
+            (0, 5), (5, 6), (6, 7), (7, 8),
+            (0, 9), (9, 10), (10, 11), (11, 12),
+            (0, 13), (13, 14), (14, 15), (15, 16),
+            (0, 17), (17, 18), (18, 19), (19, 20)
+        ]
+        
+        bones = torch.stack([landmarks[j] - landmarks[i] for i, j in bone_connections])
+        return bones  # shape: [20, 3]
+
+    @staticmethod
+    def angle(v1, v2, dim=-1, eps=1e-8):
+        """
+        Calculate the signed angle between two tensors in radians.
+        
+        Args:
+            v1, v2: Input tensors of same shape
+            dim: Dimension along which to compute the angle
+            eps: Small value to avoid division by zero
+        
+        Returns:
+            Signed angle in radians between -pi and pi
+        """
+        # Normalize the vectors
+        v1_norm = F.normalize(v1, p=2, dim=dim, eps=eps)
+        v2_norm = F.normalize(v2, p=2, dim=dim, eps=eps)
+        
+        # Dot product (cosine of angle)
+        dot_product = (v1_norm * v2_norm).sum(dim=dim)
+        
+        # Cross product magnitude (sine of angle)
+        cross_product = torch.norm(torch.cross(v1_norm, v2_norm, dim=dim), dim=dim)
+        
+        # Use atan2 to get signed angle
+        angle = torch.atan2(cross_product, dot_product)
+        
+        return angle
+
     @staticmethod
     def normalize_body_landmarks(landmarks, left_side):
         """
@@ -127,20 +171,24 @@ class ProtobufProcessor:
         if left_side:
             landmarks[:, 0] *= -1
             landmarks[:, 2] *= -1
-        origin = landmarks[0].clone().detach()  # left shoulder
-        
-        # Normalize all 10 landmarks using origin and scale
-        normalized = landmarks - origin
 
-        indices = [20, 16, 12, 8, 2, 17, 5]
+        bones = ProtobufProcessor.compute_bone_vectors(landmarks)
 
-        return normalized[indices].unsqueeze(0)  # Shape: (1, 10, 3)
+        return torch.clamp(torch.tensor([
+            (ProtobufProcessor.angle(bones[5], bones[17]) - ProtobufProcessor.angle(bones[5], bones[17]) + 0.2)/0.4,
+            ProtobufProcessor.angle(bones[19], bones[16]) / math.pi,
+            ProtobufProcessor.angle(bones[15], bones[12]) / math.pi,
+            ProtobufProcessor.angle(bones[11], bones[8]) / math.pi,
+            ProtobufProcessor.angle(bones[7], bones[4]) / math.pi,
+            2 * ProtobufProcessor.angle(bones[2], bones[1]) / math.pi,
+            2 * ProtobufProcessor.angle(bones[3], bones[2]) / math.pi
+        ]), 0.0, 1.0).view(1, 7)
     
     @staticmethod
     def normalize_body_landmarks_for_viz(landmarks, left_side):
         """Normalize body landmarks using shoulders as reference points"""
         if landmarks.shape[0] < 10:
-            return torch.zeros((1, 7, 3))  # Return zero if not enough landmarks
+            return torch.zeros((1, 22, 3))  # Return zero if not enough landmarks
 
         # Flip x for left side
         if left_side:
@@ -276,7 +324,7 @@ def _load_protobuf(pb_path, left):
     """
     proto_data = ProtobufProcessor.load_protobuf_data(pb_path)
 
-    pose_tensor = torch.empty([0, 7, 3], dtype=torch.float32)
+    pose_tensor = torch.empty([0, 7], dtype=torch.float32)
     viz_tensor = torch.empty([0, 22, 3], dtype=torch.float32)
 
     for frame in proto_data.frames[0:16]:
@@ -292,15 +340,7 @@ def _load_protobuf(pb_path, left):
         pose_tensor = torch.cat((pose_tensor, selected_landmarks), dim=0)
         viz_tensor = torch.cat((viz_tensor, selected_landmarks_for_viz), dim=0)
 
-    pose_tensor = transform_points(pose_tensor.unsqueeze(0).to(device)).squeeze()
     viz_tensor = transform_points(viz_tensor.unsqueeze(0).to(device)).squeeze()
-    # Ensure we have exactly length frames
-    # num_frames = pose_tensor.shape[0]
-    # if num_frames < length:
-    #     padding = torch.zeros([length - num_frames, 5, 3], dtype=torch.float32)
-    #     pose_tensor = torch.cat((pose_tensor, padding), dim=0)
-    # elif num_frames > length:
-    #     pose_tensor = pose_tensor[:length, :, :]
 
     return pose_tensor, viz_tensor
 
@@ -309,6 +349,8 @@ class PoseVideoCNNRNN(nn.Module):
         super(PoseVideoCNNRNN, self).__init__()
 
         # --- Encoder:
+        self.project = nn.Linear(1, 3)
+
         self.encoder = nn.Sequential(
             nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),   # → (B, 8, 15, 10, 3)
             nn.ReLU(),
@@ -370,7 +412,9 @@ class PoseVideoCNNRNN(nn.Module):
     def forward(self, pose_input, deterministic=False):
         # pose_input: (B, 15, 10, 3)
         # x = pose_input.permute(0, 4 - 1, 1, 2)  # → (B, 1, 15, 10, 3)
-        x = pose_input.unsqueeze(1)
+        x = pose_input.unsqueeze(-1)         # (B, T, 7, 1)
+        x = self.project(x)         # (B, T, 7, 3)
+        x = x.unsqueeze(1)
         # --- Encoder
         h = self.encoder(x)
 
@@ -712,19 +756,17 @@ def loss_fn(fk, pose_data, model_output, lambda_R=1.0, lambda_vel=10.0, eps=1e-7
     Returns:
         Tuple of total loss and individual loss components
     """
-    # Position loss (e.g., difference in palm position)
-    #  may select specific joints or axes; here we use the 1st vector of rotation matrix
-    # pose_loss = mse_loss(model_output[:, :, 0], pose_data[:, :, 0])
-    # pose_loss = mse_loss(model_output, pose_data)
-    #errors = torch.abs(model_output - pose_data)
-    
-    # Convert pose_data to 6D representation
-    kine_output = fk.batch_forward_kinematics(model_output)
+    pose_loss = mse_loss(model_output, pose_data)
 
-    # calculate position loss using 6d representation
-    pose_loss = mse_loss(kine_output, pose_data)
-    distances = torch.norm(kine_output - pose_data, dim=-1)
-    max_loss = torch.max(distances)
+    # distances = torch.norm(kine_output - pose_data, dim=-1)
+    # max_loss = torch.max(distances)
+
+    errors = torch.abs(model_output - pose_data)
+    max_per_joint, _ = torch.max(
+            errors.view(errors.size(0), errors.size(1), -1),
+            dim=1  # Reduce across frames and coordinates
+        )
+    max_loss = torch.mean(max_per_joint)
 
     return pose_loss
 
@@ -733,9 +775,9 @@ def test_model(sample_path, urdf_path, model_path, output_path):
     Test the neural network model
     """
 
-    model = PoseVideoCNNRNN().to(device)
-    model.load_state_dict(torch.load(model_path, weights_only=True, map_location=torch.device('cpu')), strict=False)
-    model.eval()
+    # model = PoseVideoCNNRNN().to(device)
+    # model.load_state_dict(torch.load(model_path, weights_only=True, map_location=torch.device('cpu')), strict=False)
+    # model.eval()
 
     fk = ForwardKinematics(urdf_path)
 
@@ -749,7 +791,8 @@ def test_model(sample_path, urdf_path, model_path, output_path):
         viz = viz.unsqueeze(0).to(device)
         
         # Forward pass through the model to get 6D representation
-        model_output, _, _ = model(pose, deterministic=True)
+        # model_output, _, _ = model(pose, deterministic=True)
+        model_output = pose
 
         f.write("------ "+sample+" ------\n")
         print("------ "+sample+" ------\n")

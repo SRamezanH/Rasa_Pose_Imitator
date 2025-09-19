@@ -101,6 +101,51 @@ class ProtobufProcessor:
         return transformed_landmarks
 
     @staticmethod
+    def compute_bone_vectors(landmarks):
+        """
+        landmarks: torch.Tensor of shape (21, 3)
+        returns: torch.Tensor of shape (20, 3), each row is a bone vector
+        """
+        bone_connections = [
+            (0, 1), (1, 2), (2, 3), (3, 4),
+            (0, 5), (5, 6), (6, 7), (7, 8),
+            (0, 9), (9, 10), (10, 11), (11, 12),
+            (0, 13), (13, 14), (14, 15), (15, 16),
+            (0, 17), (17, 18), (18, 19), (19, 20)
+        ]
+        
+        bones = torch.stack([landmarks[j] - landmarks[i] for i, j in bone_connections])
+        return bones  # shape: [20, 3]
+
+    @staticmethod
+    def angle(v1, v2, dim=-1, eps=1e-8):
+        """
+        Calculate the signed angle between two tensors in radians.
+        
+        Args:
+            v1, v2: Input tensors of same shape
+            dim: Dimension along which to compute the angle
+            eps: Small value to avoid division by zero
+        
+        Returns:
+            Signed angle in radians between -pi and pi
+        """
+        # Normalize the vectors
+        v1_norm = F.normalize(v1, p=2, dim=dim, eps=eps)
+        v2_norm = F.normalize(v2, p=2, dim=dim, eps=eps)
+        
+        # Dot product (cosine of angle)
+        dot_product = (v1_norm * v2_norm).sum(dim=dim)
+        
+        # Cross product magnitude (sine of angle)
+        cross_product = torch.norm(torch.cross(v1_norm, v2_norm, dim=dim), dim=dim)
+        
+        # Use atan2 to get signed angle
+        angle = torch.atan2(cross_product, dot_product)
+        
+        return angle
+
+    @staticmethod
     def normalize_body_landmarks(landmarks, left_side):
         """
         Normalize all 10 body landmarks using shoulders as reference points.
@@ -119,120 +164,18 @@ class ProtobufProcessor:
         if left_side:
             landmarks[:, 0] *= -1
             landmarks[:, 2] *= -1
-        origin = landmarks[0].clone().detach()  # left shoulder
-        
-        # Normalize all 10 landmarks using origin and scale
-        normalized = landmarks - origin
 
-        indices = [20, 16, 12, 8, 2, 17, 5]
+        bones = ProtobufProcessor.compute_bone_vectors(landmarks)
 
-        return normalized[indices].unsqueeze(0)  # Shape: (1, 10, 3)
-
-def scale_theta(points, scale=1.0):
-    """
-    Scale the angular component θ of a set of 3D points using cylindrical coordinates.
-    
-    Args:
-        points: Tensor of shape (batch, t, n, 3) in Cartesian coordinates (x, y, z)
-        theta_scale: Float, linear scale factor to apply to θ (angle)
-
-    Returns:
-        Tensor of shape (batch, t, n, 3), transformed back to Cartesian coordinates
-    """
-    x, y, z = points.unbind(-1)
-    
-    # Compute theta and scale it
-    theta = torch.atan2(y, x)
-    scale_expanded = scale.repeat(1, 1, points.size(2))
-    theta_scaled = theta * scale_expanded
-    
-    # Compute new x, y coordinates
-    rho = torch.sqrt(x**2 + y**2)
-    x_scaled = rho * torch.cos(theta_scaled)
-    y_scaled = rho * torch.sin(theta_scaled)
-    
-    return torch.stack([x_scaled, y_scaled, z], dim=-1)
-
-def transform_points(data):
-    """
-    Transforms 3D points so that:
-    - Origin stays at (0,0,0)
-    - P1 (second last) becomes (1,0,0)
-    - P2 (last) lies in positive y half of x-y plane
-    Inputs:
-        data: Tensor of shape (B, S, N+2, 3)
-    Returns:
-        Transformed data: Tensor of shape (B, S, N, 3)
-    """
-    # Split input
-    P1 = data[..., -2, :]  # Shape: (B, S, 3)
-    P2 = data[..., -1, :]  # Shape: (B, S, 3)
-    points = data[..., :-2, :]  # Shape: (B, S, N, 3)
-
-    # Step 1: Normalize P1 to unit vector
-    v1 = P1  # (B, S, 3)
-    v1_norm = torch.norm(v1, dim=-1, keepdim=True)  # (B, S, 1)
-    v1_unit = v1 / (v1_norm + 1e-8)  # Avoid division by zero
-
-    # Target direction is x-axis
-    x_axis = torch.tensor([1.0, 0.0, 0.0], device=device).expand_as(v1)
-
-    # Compute axis of rotation (cross product) and angle (dot product)
-    axis = torch.cross(v1_unit, x_axis, dim=-1)  # (B, S, 3)
-    axis_norm = torch.norm(axis, dim=-1, keepdim=True)
-    axis_unit = axis / (axis_norm + 1e-8)  # unit rotation axis
-
-    dot = (v1_unit * x_axis).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
-    angle = torch.acos(dot)  # (B, S, 1)
-
-    # Rodrigues' rotation formula to build rotation matrix R1
-    K = torch.zeros(*axis.shape[:-1], 3, 3, device=device)  # (B, S, 3, 3)
-    ax, ay, az = axis_unit.unbind(dim=-1)
-    zero = torch.zeros_like(ax)
-
-    K[..., 0, 1] = -az
-    K[..., 0, 2] = ay
-    K[..., 1, 0] = az
-    K[..., 1, 2] = -ax
-    K[..., 2, 0] = -ay
-    K[..., 2, 1] = ax
-
-    I = torch.eye(3, device=device).expand(*axis.shape[:-1], 3, 3)
-    sin = torch.sin(angle)[..., None]
-    cos = torch.cos(angle)[..., None]
-    K2 = K @ K
-
-    R1 = I + sin * K + (1 - cos) * K2  # Shape: (B, S, 3, 3)
-
-    # Apply R1 and scaling
-    points = points / (v1_norm[..., None] + 1e-8)  # scale
-    P2 = P2 / (v1_norm + 1e-8)
-
-    # Apply R1 to points and P2
-    points = torch.matmul(R1.unsqueeze(-3), points.unsqueeze(-1)).squeeze(-1)  # (B, S, N, 3)
-    P2 = torch.matmul(R1, P2.unsqueeze(-1)).squeeze(-1)  # (B, S, 3)
-
-    # Step 2: Rotate around x-axis to bring P2 into x-y plane (z=0)
-    yz = P2[..., 1:]  # (B, S, 2)
-    theta = torch.atan2(P2[..., 2], P2[..., 1])  # angle to rotate around x
-
-    cos_t = torch.cos(-theta)
-    sin_t = torch.sin(-theta)
-
-    # Build rotation matrix R2 (x-axis rotation)
-    R2 = torch.zeros(*theta.shape, 3, 3, device=device)
-    R2[..., 0, 0] = 1
-    R2[..., 1, 1] = cos_t
-    R2[..., 1, 2] = -sin_t
-    R2[..., 2, 1] = sin_t
-    R2[..., 2, 2] = cos_t
-
-    # Apply R2 to points
-    points = torch.matmul(R2.unsqueeze(-3), points.unsqueeze(-1)).squeeze(-1)  # (B, S, N, 3)
-    scale = (0.25*math.pi)/torch.acos((P2 * x_axis).sum(dim=-1, keepdim=True)/(torch.norm(P2, dim=-1, keepdim=True) + 1e-8))
-    points = scale_theta(points, scale)
-
-    return (torch.nan_to_num(points, nan=0.0) + torch.tensor([-1.0, -0.5, 0.0], device=device)) / 2.0
+        return torch.clamp(torch.tensor([
+            (ProtobufProcessor.angle(bones[5], bones[17]) - ProtobufProcessor.angle(bones[5], bones[17]) + 0.2)/0.4,
+            ProtobufProcessor.angle(bones[19], bones[16]) / math.pi,
+            ProtobufProcessor.angle(bones[15], bones[12]) / math.pi,
+            ProtobufProcessor.angle(bones[11], bones[8]) / math.pi,
+            ProtobufProcessor.angle(bones[7], bones[4]) / math.pi,
+            2 * ProtobufProcessor.angle(bones[2], bones[1]) / math.pi,
+            2 * ProtobufProcessor.angle(bones[3], bones[2]) / math.pi
+        ]), 0.0, 1.0).view(1, 7)
 
 # Dataset class for handling video and pose data
 class PoseVideoDataset(Dataset):
@@ -319,7 +262,7 @@ class PoseVideoDataset(Dataset):
         """
         proto_data = ProtobufProcessor.load_protobuf_data(pb_path)
 
-        pose_tensor = torch.empty([0, 7, 3], dtype=torch.float32)
+        pose_tensor = torch.empty([0, 7], dtype=torch.float32)
 
         for frame in proto_data.frames[start:start+length]:
             pose_landmarks = ProtobufProcessor.extract_landmark_coordinates(
@@ -330,17 +273,7 @@ class PoseVideoDataset(Dataset):
             selected_landmarks = ProtobufProcessor.normalize_body_landmarks(pose_landmarks, left)
             pose_tensor = torch.cat((pose_tensor, selected_landmarks), dim=0)
 
-        pose_tensor = transform_points(pose_tensor.unsqueeze(0).to(device)).squeeze()
-        # Ensure we have exactly length frames
-        num_frames = pose_tensor.shape[0]
-        if num_frames < length:
-            padding = torch.zeros([length - num_frames, 5, 3], dtype=torch.float32)
-            pose_tensor = torch.cat((pose_tensor, padding), dim=0)
-        elif num_frames > length:
-            pose_tensor = pose_tensor[:length, :, :]
-
         return pose_tensor  # (length, 5, 3)
-
 
 # Neural Network Model Definition
 
@@ -349,6 +282,8 @@ class PoseVideoCNNRNN(nn.Module):
         super(PoseVideoCNNRNN, self).__init__()
 
         # --- Encoder:
+        self.project = nn.Linear(1, 3)
+
         self.encoder = nn.Sequential(
             nn.Conv3d(1, 8, kernel_size=3, stride=1, padding=1),   # → (B, 8, 15, 10, 3)
             nn.ReLU(),
@@ -358,7 +293,7 @@ class PoseVideoCNNRNN(nn.Module):
             nn.Flatten()  # → (B, 16*8*5*2)
         )
 
-        latent_dim = 32
+        latent_dim = 8
 
         # Latent layers (mean + logvar)
         self.fc_mu = nn.Sequential(
@@ -410,7 +345,9 @@ class PoseVideoCNNRNN(nn.Module):
     def forward(self, pose_input, deterministic=False):
         # pose_input: (B, 15, 10, 3)
         # x = pose_input.permute(0, 4 - 1, 1, 2)  # → (B, 1, 15, 10, 3)
-        x = pose_input.unsqueeze(1)
+        x = pose_input.unsqueeze(-1)         # (B, T, 7, 1)
+        x = self.project(x)         # (B, T, 7, 3)
+        x = x.unsqueeze(1)
         # --- Encoder
         h = self.encoder(x)
 
@@ -619,14 +556,12 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, gamma=1.0, normalize=True, 
     Returns:
         Tuple of total loss and individual loss components
     """
-    kine_output = fk.batch_forward_kinematics(model_output)
-
-    pose_loss = mse_loss(kine_output, pose_data)
+    pose_loss = mse_loss(model_output, pose_data)
 
     # distances = torch.norm(kine_output - pose_data, dim=-1)
     # max_loss = torch.max(distances)
 
-    errors = torch.abs(kine_output - pose_data)
+    errors = torch.abs(model_output - pose_data)
     max_per_joint, _ = torch.max(
             errors.view(errors.size(0), errors.size(1), -1),
             dim=1  # Reduce across frames and coordinates
@@ -636,7 +571,7 @@ def loss_fn(fk, pose_data, model_output, logvar, mu, gamma=1.0, normalize=True, 
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
     # Combine all loss terms
-    loss = max_loss + lambda_kl * kl_loss
+    loss = pose_loss + lambda_kl * kl_loss
     return loss, pose_loss, max_loss, kl_loss
 
 def lambda_scheduler(current_epoch, warmup_start=5, warmup_end=10, final_value=0.5):
@@ -765,7 +700,7 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
             total=len(train_loader)
         )
 
-        lambda_kl = lambda_scheduler(epoch, warmup_start=5, warmup_end=15, final_value=0.1)#0.1 * (min(1, 0.005 * (epoch+1)))
+        lambda_kl = 0.1#lambda_scheduler(epoch, warmup_start=5, warmup_end=15, final_value=0.1)#0.1 * (min(1, 0.005 * (epoch+1)))
 
         for i, batch in enumerate(batch_pbar):
             # video_data = batch["video"]  # Shape: [batch, 15, 3, 258, 196]
@@ -958,7 +893,7 @@ def main():
     DEFAULT_TEST_DIR = "../dataset/test"
     DEFAULT_VIDEO_DIR = "../1_clips"
     DEFAULT_URDF_PATH = "../rasa/hand.urdf"
-    DEFAULT_NUM_EPOCHS = 100
+    DEFAULT_NUM_EPOCHS = 10
     DEFAULT_BATCH_SIZE = 64
 
     # Parse command-line arguments
