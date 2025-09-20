@@ -775,9 +775,9 @@ def test_model(sample_path, urdf_path, model_path, output_path):
     Test the neural network model
     """
 
-    # model = PoseVideoCNNRNN().to(device)
-    # model.load_state_dict(torch.load(model_path, weights_only=True, map_location=torch.device('cpu')), strict=False)
-    # model.eval()
+    model = PoseVideoCNNRNN().to(device)
+    model.load_state_dict(torch.load(model_path, weights_only=True, map_location=torch.device('cpu')), strict=False)
+    model.eval()
 
     fk = ForwardKinematics(urdf_path)
 

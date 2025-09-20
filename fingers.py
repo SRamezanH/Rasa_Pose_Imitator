@@ -224,7 +224,7 @@ class PoseVideoDataset(Dataset):
         # Load pose data from protobuf
         pose_data = self._load_protobuf(sample["pb_path"], sample["pb_start"], self.length, sample["left"])
 
-        return {"pose": pose_data}
+        return {"pose": pose_data, "name":sample["pb_path"]+str(sample["pb_start"])}
 
     def _load_video(self, video_path, start, length):
         """
@@ -824,7 +824,6 @@ def train_model(data_dir, test_dir, video_dir, urdf_path, num_epochs=10, batch_s
     print(f"\nTraining completed in {num_epochs} epochs")
 
     # Evaluation on test data
-    # model.load_state_dict(torch.load("/home/cedra/psl_project/sign_language_pose_model_v3.2_100.pth", weights_only=True))
     print("\nEvaluating model on test data...")
     model.eval()  # Set model to evaluation mode
     test_loss = 0
