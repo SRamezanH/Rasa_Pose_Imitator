@@ -797,8 +797,8 @@ def main():
     DEFAULT_TEST_DIR = "../dataset/test"
     DEFAULT_VIDEO_DIR = "../1_clips"
     DEFAULT_URDF_PATH = "../rasa/hand.urdf"
-    DEFAULT_NUM_EPOCHS = 100
-    DEFAULT_BATCH_SIZE = 16
+    DEFAULT_NUM_EPOCHS = 50
+    DEFAULT_BATCH_SIZE = 64
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser(
