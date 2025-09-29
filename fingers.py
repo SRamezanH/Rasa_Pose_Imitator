@@ -168,7 +168,7 @@ class ProtobufProcessor:
         bones = ProtobufProcessor.compute_bone_vectors(landmarks)
 
         return torch.clamp(torch.tensor([
-            (ProtobufProcessor.angle(bones[5], bones[17]) - ProtobufProcessor.angle(bones[5], bones[17]) + 0.2)/0.4,
+            (ProtobufProcessor.angle(bones[4], bones[16]) - ProtobufProcessor.angle(bones[5], bones[17]) + 0.2)/0.4,
             ProtobufProcessor.angle(bones[19], bones[16]) / math.pi,
             ProtobufProcessor.angle(bones[15], bones[12]) / math.pi,
             ProtobufProcessor.angle(bones[11], bones[8]) / math.pi,
